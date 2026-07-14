@@ -1,3 +1,4 @@
+use std::net::{Ipv4Addr, SocketAddrV4};
 use crate::file_set::FileSet;
 use crate::messages::Message;
 use anyhow::Result;
@@ -24,6 +25,10 @@ pub const HEADER_SIZE: u64 = (4 + 8);
 pub const PAYLOAD_SIZE: u64 = 1400 - HEADER_SIZE;
 pub const PAYLOAD_SIZE_USIZE: usize = PAYLOAD_SIZE as usize;
 pub const PAYLOAD_SIZE_USIZE_WITHOUT_HASH: usize = PAYLOAD_SIZE_USIZE - CHECKSUM_SIZE;
+
+pub const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
+pub const DEFAULT_MCAST_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(230, 1, 2, 3), 5523);
+
 
 pub struct Position {
     pub phase: u16,
@@ -248,6 +253,7 @@ mod messages {
         }
 
         pub fn msg_deserialize(mut input: Bytes) -> Result<Message> {
+            println!("Received {:?}", &input[..]);
             Ok(Deserializer::bare_deserialize(&mut input.reader(), 0)?)
             /*savefile::prelude::load_from_mem()
 
@@ -716,12 +722,9 @@ mod server {
     use std::time::{Duration, Instant};
 
     use crate::disk_read_engine::ReadEngine;
-    use crate::file_set::FileSet;
-    use crate::messages::{LinkQualitySignal, Message, Request};
-    use crate::{
-        MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, PacketIdx, RetransmitGeneration, SessionId,
-        overlaps,
-    };
+    use crate::file_set::{FileSet, Meta};
+    use crate::messages::{Announce, LinkQualitySignal, Message, Request};
+    use crate::{overlaps, PacketIdx, RetransmitGeneration, SessionId, DEFAULT_BIND_ADDRESS, MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, DEFAULT_MCAST_ADDR};
     use anyhow::{Result, bail};
     use compio::BufResult;
     use compio::bytes::{BufMut, Bytes, BytesMut};
@@ -730,21 +733,32 @@ mod server {
     use rangemap::RangeMap;
     use savefile::Serialize;
     use smallvec::SmallVec;
+    use crate::util::reusable_multicast_socket;
 
     #[derive(Clone, Debug)]
-    struct Config {
-        local_iface: Ipv4Addr,
-        mcast_addr: SocketAddrV4,
-        phases: Vec<PathBuf>,
+    pub struct ServerConfig {
+        pub local_iface: Ipv4Addr,
+        pub mcast_addr: SocketAddrV4,
+        pub phases: Vec<PathBuf>,
+    }
+
+    impl Default for ServerConfig {
+        fn default() -> Self {
+            ServerConfig {
+                local_iface: DEFAULT_BIND_ADDRESS,
+                mcast_addr: DEFAULT_MCAST_ADDR,
+                phases: vec![".".into()],
+            }
+        }
     }
 
     const PACK_LEADER_CHANGE_TIME: Duration = Duration::from_millis(100);
 
-    struct ServerState {
-        config: Config,
+    pub struct ServerState {
+        config: ServerConfig,
         logic_state: ServerLogicState,
         session_id: SessionId,
-        socket: compio::net::UdpSocket,
+        socket: Arc<compio::net::UdpSocket>,
     }
 
     struct Pacing {
@@ -774,6 +788,8 @@ mod server {
         }
     }
 
+
+
     struct ServerLogicState {
         session_id: SessionId,
         tx: flume::Sender<(RetransmitGeneration, Range<PacketIdx>)>,
@@ -784,6 +800,8 @@ mod server {
         packet_leader_position: PacketIdx,
         pack_leader_last_head: Instant,
         pacing: Pacing,
+        meta: Meta,
+        socket: Arc<compio::net::UdpSocket>,
     }
 
     impl ServerLogicState {
@@ -857,7 +875,22 @@ mod server {
             );
             Ok(())
         }
-        fn receive_message(&mut self, input: Bytes, src: SocketAddr) -> Result<()> {
+        async fn process_request_announce(&mut self, dst: SocketAddr) -> Result<()> {
+            let mut buf = BytesMut::new();
+            Message::Announce(Announce {
+                session_id: self.session_id,
+                retransmit_generation: self.current_retransmit_generation,
+                fileset_size: self.meta.fileset_buf.len() as u64,
+                phases: self.meta.phases,
+                file_count: self.meta.file_count,
+                total_size_bytes: self.meta.total_size_bytes,
+            }).msg_serialize(&mut buf);
+
+            self.socket.send_to(buf, dst).await.0?;
+
+            Ok(())
+        }
+        async fn receive_message(&mut self, input: Bytes, src: SocketAddr) -> Result<()> {
             let msg = Message::msg_deserialize(input)?;
             if let Some(msg_session_id) = msg.session_id()
                 && msg_session_id != self.session_id
@@ -870,7 +903,9 @@ mod server {
                 }
                 Message::Payload(_) => {}
                 Message::Announce(_) => {}
-                Message::RequestAnnounce => {}
+                Message::RequestAnnounce => {
+                    self.process_request_announce(src).await?;
+                }
             }
 
             Ok(())
@@ -881,16 +916,15 @@ mod server {
         pub async fn worker(
             rx: flume::Receiver<(RetransmitGeneration, Range<PacketIdx>)>,
             session_id: SessionId,
-            config: Config,
+            config: ServerConfig,
             mut read_engine: ReadEngine,
+            socket: Arc<UdpSocket>,
         ) -> Result<()> {
-            let socket =
-                compio::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(config.local_iface), 0))
-                    .await?;
 
             spawn(async move {
                 let mut buf = Some(BytesMut::new());
                 loop {
+
                     let Ok((generation, pkts)) = rx.recv_async().await else {
                         return;
                     };
@@ -929,14 +963,13 @@ mod server {
 
             Ok(())
         }
-        pub async fn run(config: Config) -> Result<()> {
+        pub async fn run(config: ServerConfig) -> Result<()> {
             let (tx, rx) = flume::unbounded();
             let session_id = SessionId::make_random();
 
-            let receive_socket = UdpSocket::bind(config.mcast_addr).await?;
+            let main_socket = Arc::new(reusable_multicast_socket(config.mcast_addr, config.local_iface)?);
 
-            receive_socket.join_multicast_v4(&config.mcast_addr.ip(), &config.local_iface)?;
-            receive_socket.set_multicast_loop_v4(true)?; //TODO: Don't use loopback unless local needed
+            let files = FileSet::new(config.phases.clone())?;
 
             let mut state = ServerState {
                 config,
@@ -949,27 +982,31 @@ mod server {
                     packet_leader_position: PacketIdx(0),
                     pack_leader_last_head: Instant::now(),
                     pacing: Pacing::default(),
+                    meta: files.meta()?,
+                    socket: main_socket.clone(),
                 },
                 //TODO: don't store sessionid twice
                 session_id,
-                socket: receive_socket,
+                socket: main_socket.clone(),
             };
 
             let mut buf = BytesMut::with_capacity(MTU_USIZE);
 
-            let files = FileSet::new(state.config.phases.clone())?;
             let re = ReadEngine::new(state.session_id, files).await;
 
-            Self::worker(rx, session_id, state.config.clone(), re).await?;
+            Self::worker(rx, session_id, state.config.clone(), re, main_socket.clone()).await?;
 
             loop {
+                println!("Server calling socket.recv_from");
                 buf = match state.socket.recv_from(buf).await.into_parts() {
                     (Ok((size, src)), rbuf) => {
+
                         match state
                             .logic_state
-                            .receive_message(rbuf.clone().freeze(), src)
+                            .receive_message(rbuf.clone().freeze(), src).await
                         {
-                            Ok(()) => {}
+                            Ok(()) => {
+                            }
                             Err(err) => {
                                 eprintln!("failed to process incoming message {:?}", err);
                             }
@@ -990,7 +1027,7 @@ mod server {
 mod client {
     use crate::file_set::FileSet;
     use crate::messages::{LinkQualitySignal, Message, Request};
-    use crate::{Bytes, PhaseOffset, SessionId, MTU_USIZE, PacketIdx, calculate_phase_offset, RetransmitGeneration};
+    use crate::{Bytes, PhaseOffset, SessionId, MTU_USIZE, PacketIdx, calculate_phase_offset, RetransmitGeneration, DEFAULT_BIND_ADDRESS, DEFAULT_MCAST_ADDR};
     use anyhow::{Result, bail};
     use compio::bytes::{Buf, BufMut, BytesMut};
     use compio::net::UdpSocket;
@@ -1006,11 +1043,22 @@ mod client {
     use futures_util::stream::FuturesUnordered;
     use indexmap::IndexSet;
     use rangemap::RangeSet;
+    use crate::util::reusable_multicast_socket;
 
     pub struct ClientConfig {
         paths: Vec<PathBuf>,
         bind_address: Ipv4Addr,
         mcast_addr: SocketAddrV4,
+    }
+
+    impl Default for ClientConfig {
+        fn default() -> Self {
+            ClientConfig {
+                paths: vec!["out".into()],
+                bind_address: DEFAULT_BIND_ADDRESS,
+                mcast_addr: DEFAULT_MCAST_ADDR,
+            }
+        }
     }
 
     pub enum ClientStateEnum {
@@ -1029,10 +1077,9 @@ mod client {
         },
         Invalid,
     }
-    struct ClientState {
+    pub struct ClientState {
         state: ClientStateEnum,
-        recv_socket: UdpSocket,
-        send_socket: UdpSocket,
+        main_socket: UdpSocket,
         config: ClientConfig,
     }
 
@@ -1172,7 +1219,6 @@ mod client {
         pub async fn sync(
                           session_id: SessionId,
                           //TODO: Move sockets into some abstraction
-                          send_socket: &UdpSocket,
                           recv_socket: &UdpSocket,
                           mut receiver: &mut impl BlockReceiver,
                           phases: &[(u16/*phase*/, PhaseOffset/*size*/)],
@@ -1234,7 +1280,7 @@ mod client {
                         Ok(msg) => msg,
                         Err(_elapsed) => {
                             let phase_missing = &missing[*phase as usize];
-                            sendbuf = send_request(sendbuf,&send_socket, *phase, session_id,
+                            sendbuf = send_request(sendbuf,&recv_socket, *phase, session_id,
                                                    phase_missing, last_retransmit_generation, loss, peer
                             ).await?;
                             loss = LinkQualitySignal::KeepGoing;
@@ -1313,16 +1359,11 @@ mod client {
 
     impl ClientState {
         pub async fn new(config: ClientConfig) -> Result<ClientState> {
-            let recv_socket = UdpSocket::bind(config.mcast_addr).await?;
-            recv_socket.join_multicast_v4(&config.mcast_addr.ip(), &config.bind_address)?;
-            recv_socket.set_multicast_loop_v4(true)?;
-
-            let send_socket = UdpSocket::bind(SocketAddrV4::new(config.bind_address, 0)).await?;
+            let recv_socket = reusable_multicast_socket(config.mcast_addr, config.bind_address)?;
 
             Ok(ClientState {
                 state: ClientStateEnum::Initializing,
-                recv_socket,
-                send_socket,
+                main_socket: recv_socket,
                 config,
             })
         }
@@ -1334,7 +1375,7 @@ mod client {
             loop {
                 let mut buf = BytesMut::new();
                 req.msg_serialize(&mut buf);
-                self.send_socket
+                self.main_socket
                     .send_to(buf, self.config.mcast_addr)
                     .await
                     .into_parts()
@@ -1342,12 +1383,14 @@ mod client {
 
                 match compio::time::timeout(
                     Duration::from_secs(1),
-                    self.recv_socket.recv_from(BytesMut::new()),
+                    self.main_socket.recv_from(BytesMut::with_capacity(MTU_USIZE)),
                 )
                 .await
                 {
                     Ok(x) => match x.into_parts() {
-                        (Ok((_size, SocketAddr::V4(src))), mut buf) => {
+
+                        (Ok((size, SocketAddr::V4(src))), mut buf) => {
+                            println!("Received {} byte message", size);
                             let msg = Message::msg_deserialize(buf.freeze())?;
                             match msg {
                                 Message::Request(_) => {}
@@ -1370,7 +1413,7 @@ mod client {
                     }
                 }
 
-                compio::time::sleep(Duration::from_millis(50)).await;
+                compio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
 
@@ -1393,8 +1436,8 @@ mod client {
                     }
                     ClientStateEnum::AwaitingFileSet { session_id, phases, server, mut buf } => {
                         let phase_0_size = buf.len();
-                        ClientProtocolHandler::sync(session_id, &self.send_socket, &self.recv_socket,
-                                                    &mut buf,&[(0,PhaseOffset(phase_0_size as u64))], server
+                        ClientProtocolHandler::sync(session_id, &self.main_socket,
+                                                    &mut buf, &[(0,PhaseOffset(phase_0_size as u64))], server
                         ).await?;
 
                         let fileset: FileSet = Deserializer::bare_deserialize(&mut buf.reader(), 0)?;
@@ -1411,8 +1454,8 @@ mod client {
                     }
                     ClientStateEnum::Receiving { phases, mut  fileset, session_id, server } => {
 
-                        ClientProtocolHandler::sync(session_id, &self.send_socket, &self.recv_socket,
-                                                    &mut fileset,&phases, server
+                        ClientProtocolHandler::sync(session_id,  &self.main_socket,
+                                                    &mut fileset, &phases, server
                         ).await?;
 
                         fileset.shutdown().await;
@@ -1444,7 +1487,9 @@ mod file_set {
     use std::ops::{Range, RangeInclusive};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use compio::bytes::{BufMut, Bytes, BytesMut};
     use savefile::prelude::Savefile;
+    use savefile::Serializer;
 
     #[derive(Savefile,Debug)]
     enum Kind {
@@ -1490,6 +1535,23 @@ mod file_set {
     }
 
     impl Entry {
+        pub(crate) fn file_count(&self) -> u64 {
+            match self {
+                File(_) => {1}
+                Entry::Directory(d) => {
+                    d.files.iter().map(|x|x.file_count()).sum()
+                }
+            }
+        }
+        pub(crate) fn file_size(&self) -> u64 {
+            match self {
+                File(f) => {f.size}
+                Entry::Directory(d) => {
+                    d.files.iter().map(|x|x.file_size()).sum()
+                }
+            }
+        }
+
         pub fn name(&self) -> &Path {
             match self {
                 File(f) => &f.name,
@@ -1501,9 +1563,17 @@ mod file_set {
     #[derive(Savefile, Debug)]
     pub struct FileSet {
         /// Base and entry
+        ///
+        /// This does not include the fileset phase (phase 0)
         phases: Vec<(PathBuf, Entry)>,
     }
 
+    pub struct Meta {
+        pub fileset_buf: Bytes,
+        pub phases: u16,
+        pub file_count: u64,
+        pub total_size_bytes: u64,
+    }
 
     fn mode(permissions: Permissions) -> u32 {
         #[cfg(target_family = "unix")]
@@ -1636,6 +1706,19 @@ mod file_set {
 
         pub fn num_phases(&self) -> usize {
             self.phases.len()
+        }
+
+        pub fn meta(&self) -> Result<Meta> {
+            let mut fileset_buf = BytesMut::new();
+
+            Serializer::bare_serialize(&mut (&mut fileset_buf).writer(), 0, self)?;
+
+            Ok(Meta {
+                fileset_buf: fileset_buf.freeze(),
+                phases: self.phases.len() as u16,
+                file_count: self.phases.iter().map(|x|x.1.file_count()).sum(),
+                total_size_bytes: self.phases.iter().map(|x|x.1.file_size()).sum(),
+            })
         }
 
         /// Always visits in PhaseOffset-order, guaranteed
@@ -1894,6 +1977,10 @@ mod file_set {
 }
 
 mod util {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use compio::net::UdpSocket;
+    use socket2::{Domain, Protocol, Socket, Type};
+
     pub fn fast_hash(bytes: &[u8]) -> u64 {
         const K: u64 = 0x517c_c1b7_2722_0a95; // odd, well-mixed constant
 
@@ -1920,8 +2007,64 @@ mod util {
         hash ^= hash >> 32;
         hash
     }
+
+    pub fn reusable_multicast_socket(
+        group: SocketAddrV4,
+        iface: Ipv4Addr,
+    ) -> std::io::Result<UdpSocket> {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+        // The important bit — allow multiple binds to the same addr/port.
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?; // needed on Linux for multiple receivers
+
+        // Bind to the port. Binding to INADDR_ANY (or the group addr) + reuse
+        // lets several sockets share it.
+        let bind_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port()).into();
+        sock.bind(&bind_addr.into())?;
+
+        // Join the multicast group.
+        sock.join_multicast_v4(&group.ip(), &iface)?;
+
+        sock.set_multicast_loop_v4(true)?;
+
+        // Convert socket2 -> std -> compio.
+        let std_sock: std::net::UdpSocket = sock.into();
+
+        std_sock.set_nonblocking(true)?; // harmless; keeps semantics consistent
+        Ok(UdpSocket::from_std(std_sock)?)
+    }
+
 }
 
 fn main() {
     println!("Hello, world!");
+}
+
+
+mod tests {
+    use compio::runtime::spawn;
+    use crate::client;
+    use crate::client::ClientConfig;
+    use crate::server::ServerConfig;
+
+    #[compio::test]
+    async fn start_client() {
+        spawn(async move {
+            let mut client = client::ClientState::new(ClientConfig::default()).await.unwrap();
+            client.run().await.unwrap();
+        }).detach();
+
+
+        super::server::ServerState::run(ServerConfig {
+            phases: vec![
+                "/home/anders/sample".into()
+            ],
+            ..ServerConfig::default()
+        }).await.unwrap();
+
+
+    }
+
 }
