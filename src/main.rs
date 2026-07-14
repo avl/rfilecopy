@@ -253,7 +253,6 @@ mod messages {
         }
 
         pub fn msg_deserialize(mut input: Bytes) -> Result<Message> {
-            println!("Received {:?}", &input[..]);
             Ok(Deserializer::bare_deserialize(&mut input.reader(), 0)?)
             /*savefile::prelude::load_from_mem()
 
@@ -881,7 +880,7 @@ mod server {
                 session_id: self.session_id,
                 retransmit_generation: self.current_retransmit_generation,
                 fileset_size: self.meta.fileset_buf.len() as u64,
-                phases: self.meta.phases,
+                phases: self.meta.phases + 1,
                 file_count: self.meta.file_count,
                 total_size_bytes: self.meta.total_size_bytes,
             }).msg_serialize(&mut buf);
@@ -904,6 +903,7 @@ mod server {
                 Message::Payload(_) => {}
                 Message::Announce(_) => {}
                 Message::RequestAnnounce => {
+                    println!("Server got announce request");
                     self.process_request_announce(src).await?;
                 }
             }
@@ -1390,7 +1390,7 @@ mod client {
                     Ok(x) => match x.into_parts() {
 
                         (Ok((size, SocketAddr::V4(src))), mut buf) => {
-                            println!("Received {} byte message", size);
+                            println!("Client received {} byte message", size);
                             let msg = Message::msg_deserialize(buf.freeze())?;
                             match msg {
                                 Message::Request(_) => {}
@@ -1570,6 +1570,7 @@ mod file_set {
 
     pub struct Meta {
         pub fileset_buf: Bytes,
+        /// This is the number of phases excluding the FileSet phase
         pub phases: u16,
         pub file_count: u64,
         pub total_size_bytes: u64,
