@@ -1,0 +1,19 @@
+[package]
+name = "rfilecopy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+compio= { version = "0.19.1", features = ["runtime", "net", "fs", "time", "macros", "bytes"] }
+savefile= { version = "0.21.0", path = "../savefile/savefile", features = ["bytes"] }
+arrayvec = "0.7.8"
+rayon="1.12.0"
+anyhow = "1.0.103"
+lru = "0.18.1"
+flume = "0.12.0"
+indexmap = "2.14.0"
+rangemap = "1.7.1"
+smallvec = "1.15.2"
+blake3 = "1.8.5"
+rand = "0.10.2"
+futures-util ="0.3.32"
