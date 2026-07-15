@@ -1,7 +1,8 @@
+use std::fmt::{Debug, Formatter};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use crate::file_set::FileSet;
 use crate::messages::Message;
-use anyhow::Result;
+use anyhow::{bail, Result};
 pub use compio::bytes::Bytes;
 use compio::bytes::{Buf, BufMut, BytesMut};
 use rand::random;
@@ -9,6 +10,12 @@ use savefile::IntrospectionError::IndexOutOfRange;
 use savefile::prelude::Savefile;
 use std::ops::Index;
 use std::ops::{Range, RangeInclusive};
+use std::path::PathBuf;
+use compio::runtime::spawn;
+use tracing::debug;
+use crate::client::ClientConfig;
+use crate::server::{ServerConfig, ServerState};
+use crate::util::setup_tracing;
 
 pub const CHECKSUM_SIZE: usize = 16;
 pub const CHECKSUM_SIZE_U64: u64 = CHECKSUM_SIZE as u64;
@@ -21,7 +28,7 @@ pub const MAX_BURST_SIZE: usize = 10000;
 
 pub const MTU: u64 = 1400;
 pub const MTU_USIZE: usize = MTU as usize;
-pub const HEADER_SIZE: u64 = (4 + 8);
+pub const HEADER_SIZE: u64 = Message::PAYLOAD_HEADER_SIZE;
 pub const PAYLOAD_SIZE: u64 = 1400 - HEADER_SIZE;
 pub const PAYLOAD_SIZE_USIZE: usize = PAYLOAD_SIZE as usize;
 pub const PAYLOAD_SIZE_USIZE_WITHOUT_HASH: usize = PAYLOAD_SIZE_USIZE - CHECKSUM_SIZE;
@@ -59,8 +66,17 @@ impl RetransmitGeneration {
 /// This means all packets can be identified by a
 /// phase + index. The size of the last packet (only) can differ
 /// from MTU.
-#[derive(Savefile, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Savefile, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PacketIdx(u64);
+
+impl Debug for PacketIdx {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}.{}",
+            self.0>>48,
+            self.0&0xffff_ffff_ffff
+        )
+    }
+}
 
 /// The index of a packet within a specific phase.
 #[derive(Savefile, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -69,6 +85,16 @@ pub struct IndexInPhase(pub u64);
 /// Offset within a phase, in bytes
 #[derive(Savefile, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PhaseOffset(pub u64);
+
+impl PhaseOffset {
+    pub const MAX_OFFSET: PhaseOffset = PhaseOffset(IndexInPhase::MAX_INDEX.0*PAYLOAD_SIZE);
+    pub(crate) fn floor_index(&self) -> IndexInPhase {
+        IndexInPhase(self.0 / PAYLOAD_SIZE)
+    }
+    pub(crate) fn ceil_index(&self) -> IndexInPhase {
+        IndexInPhase(self.0.div_ceil(PAYLOAD_SIZE))
+    }
+}
 
 impl IndexInPhase {
     pub const ZERO: IndexInPhase = IndexInPhase(0);
@@ -86,6 +112,13 @@ pub fn overlaps<T: Ord>(a: Range<T>, b: Range<T>) -> Option<Range<T>> {
     Some((a.start.max(b.start)..b.end.min(a.end)).into())
 }
 
+/// Returns true if the range 'a' contains all of range 'b'.
+///
+/// Returns true if both are empty.
+pub fn contains<T: Ord>(a: Range<T>, b: Range<T>) -> bool {
+    a.start <= b.start && a.end >= b.end
+}
+
 pub fn calculate_phase_offset(index_in_phase: IndexInPhase) -> PhaseOffset {
     PhaseOffset(index_in_phase.0 * PAYLOAD_SIZE)
 }
@@ -98,7 +131,7 @@ pub fn byte_range(index_in_phase: Range<IndexInPhase>) -> Range<PhaseOffset> {
 
 impl PhaseOffset {
     pub const ZERO: PhaseOffset = PhaseOffset(0);
-    pub const MAX_OFFSET: PhaseOffset = PhaseOffset(0xffff_ffff_ffff);
+
 }
 
 impl PacketIdx {
@@ -109,8 +142,8 @@ impl PacketIdx {
         data.put_u64(self.0);
     }
 
-    pub fn new(phase: u16, index: PhaseOffset) -> Self {
-        if index > PhaseOffset::MAX_OFFSET {
+    pub fn new(phase: u16, index: IndexInPhase) -> Self {
+        if index > IndexInPhase::MAX_INDEX {
             panic!("index too large");
         }
         Self((phase as u64) << 48 | index.0)
@@ -152,7 +185,7 @@ impl PacketIdx {
 }
 
 mod messages {
-    use crate::{PacketIdx, PhaseOffset, RetransmitGeneration, SessionId};
+    use crate::{PacketIdx, PhaseOffset, RetransmitGeneration, SessionId, MTU_USIZE, IndexInPhase};
     use anyhow::{Result, bail};
     use arrayvec::ArrayVec;
     use compio::bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -177,7 +210,7 @@ mod messages {
         pub retransmit_generation: RetransmitGeneration,
         /// Client did not receiver everything it wanted.
         pub loss: LinkQualitySignal,
-        pub sections: ArrayVec<Range<PhaseOffset>, MAX_SECTIONS_PER_REQUEST>,
+        pub sections: ArrayVec<Range<IndexInPhase>, MAX_SECTIONS_PER_REQUEST>,
     }
 
     #[derive(Savefile, Clone, PartialEq, Eq, Debug)]
@@ -191,10 +224,16 @@ mod messages {
         pub data: Bytes,
     }
 
+    impl Message {
+        /// Size of a 0-payload `Message::Payload` message.
+        ///
+        /// Includes Message tag and payload size field.
+        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 2 + 8 + 1 + 8;
+    }
+
     #[derive(Savefile, PartialEq, Debug)]
     pub struct Announce {
         pub session_id: SessionId,
-        pub retransmit_generation: RetransmitGeneration,
         pub fileset_size: u64,
         pub phases: u16,
         pub file_count: u64,
@@ -202,6 +241,7 @@ mod messages {
     }
 
     #[derive(Savefile, PartialEq, Debug)]
+    #[repr(u8,C)]
     pub enum Message {
         Request(Request),
         Payload(Payload),
@@ -220,6 +260,7 @@ mod messages {
         }
         pub fn msg_serialize(&self, output: &mut BytesMut) {
             Serializer::bare_serialize(&mut output.writer(), 0, self).unwrap();
+            assert!(output.len() <= MTU_USIZE, "output was {} but MTU is {}", output.len(), MTU_USIZE);
             /*match self {
                 Message::Request(r) => {
                     output.put_u8(0);
@@ -253,8 +294,11 @@ mod messages {
         }
 
         pub fn msg_deserialize(mut input: Bytes) -> Result<Message> {
-            Ok(Deserializer::bare_deserialize(&mut input.reader(), 0)?)
-            /*savefile::prelude::load_from_mem()
+            //debug!("bef savefile: {:?}", input);
+            let t= Ok(Deserializer::bare_deserialize(&mut input.reader(), 0)?);
+
+            t
+            /*
 
             match input.try_get_u8()? {
                 0 => {
@@ -338,8 +382,6 @@ mod messages {
             }));
             roundtrip(Message::Announce(Announce {
                 session_id: SessionId(42),
-
-                retransmit_generation: RetransmitGeneration(37),
                 fileset_size: 2,
                 phases: 1,
                 file_count: 43,
@@ -351,13 +393,9 @@ mod messages {
 }
 
 mod disk_read_engine {
-    use crate::file_set::FileSet;
+    use crate::file_set::{FileSet, Kind, OwnedSource, OwnedSourceId, Source};
     use crate::messages::Payload;
-    use crate::{
-        CHECKSUM_SIZE, CHECKSUM_SIZE_U64, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE,
-        PAYLOAD_SIZE_USIZE_WITHOUT_HASH, PRE_REQUEST_TIME, PacketIdx, PhaseOffset, PhaseSize,
-        RetransmitGeneration, SessionId, calculate_phase_offset, messages,
-    };
+    use crate::{calculate_phase_offset, messages, IndexInPhase, PacketIdx, PhaseOffset, PhaseSize, RetransmitGeneration, SessionId, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE, PAYLOAD_SIZE_USIZE_WITHOUT_HASH, PRE_REQUEST_TIME};
     use anyhow::{Result, bail};
     use compio::BufResult;
     use compio::buf::{IoBuf, IoBufMut, SetLen};
@@ -374,6 +412,7 @@ mod disk_read_engine {
     use std::ops::{Range, RangeInclusive};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use tracing::trace;
 
     const READ_WORKERS: usize = 16;
     const CACHE_SIZE_PACKETS: usize = 10000;
@@ -447,7 +486,7 @@ mod disk_read_engine {
 
     pub struct ReadEngine {
         files: Arc<FileSet>,
-        checksums: HashMap<PathBuf, ChecksummingState>,
+        checksums: HashMap<OwnedSourceId, ChecksummingState>,
     }
 
     struct ReadAtom {
@@ -489,9 +528,9 @@ mod disk_read_engine {
             rx: flume::Receiver<WorkerRequest>) -> Result<()> {
 
             loop {
-                println!("WOrker working");
+                debug!("WOrker working");
                 let Ok(mut req) = rx.recv_async().await else {
-                    println!("Worker exiting");
+                    debug!("Worker exiting");
                     return Ok(());
                 };
                 let mut file = compio::fs::File::open(&req.path).await?;
@@ -546,7 +585,7 @@ mod disk_read_engine {
 
         fn fetch(&mut self, range: Range<PacketIdx>) {
             self.inflight.insert(range.into());
-            println!("CAching request sent");
+            debug!("CAching request sent");
             self.cacher_requests.send(range).expect("workers should continue to run");
         }
 
@@ -573,88 +612,125 @@ mod disk_read_engine {
             //TODO: Reuse these buffers
             let mut tasks = Vec::new();
 
+            trace!("visiting files to send idx {:?}", idx);
             self.files
                 .visit(
                     idx.clone(),
-                    &mut |phase, phase_offset, path, offset, file_size| {
-                        tasks.push((phase, phase_offset, path.to_path_buf(), offset, file_size));
+                    //TODO: Change from crazy-many parameters to a struct
+                    &mut |phase, phase_offset, source, offset, file_size, is_link| {
+                        //TODO: Get rid of allocation here in 'to_owned'
+                        tasks.push((phase, phase_offset, source.to_owned(), offset, file_size, is_link));
                     },
                 )
                 .expect("visit cannot fail");
+            if !idx.is_empty() {
+                assert!(!tasks.is_empty(), "no tasks for fetching range {idx:?}");
+            }
 
             let mut buf = BytesMut::new();
 
             let mut output_idx = idx;
 
             let task_len = tasks.len();
-            for (task_i, (phase, phase_offset, path, offset, nominal_file_size)) in
+            for (task_i, (phase, phase_offset, source, offset, nominal_file_size, kind)) in
                 tasks.into_iter().enumerate()
             {
-                let mut file = compio::fs::File::open(&path).await?;
+                trace!("fetch task: {task_i}, offset = {offset}, nominal_file_size = {nominal_file_size}, kind = {kind:?}");
                 let real_file_size = nominal_file_size - CHECKSUM_SIZE_U64;
-                let chunk_size = (phase_offset.end - phase_offset.start).min(real_file_size);
+                let chunk_size = (phase_offset.end - phase_offset.start).min(real_file_size - offset);
+                assert!(chunk_size + offset <= real_file_size + 16,
+                    "chunk_size = {}, offset = {}, this is greater than real file size {} + 16",
+                    chunk_size, offset, real_file_size
+                );
                 buf.reserve(chunk_size as usize + CHECKSUM_SIZE);
                 let buflen = buf.len();
-                buf = match file
-                    .read_exact_at(
-                        BytesMutTake(buf, buflen, buflen + chunk_size as usize),
-                        offset,
-                    )
-                    .await
-                    .into_parts()
-                {
-                    (Ok(_), mut buf) => {
-                        let cksumstate = match self.checksums.get_mut(&path) {
-                            Some(cksum) => cksum,
-                            None => self.checksums.entry(path.to_path_buf()).or_default(),
-                        };
-                        match cksumstate {
-                            ChecksummingState::Hashing {
-                                hasher,
-                                offset: hashed_offset,
-                            } => {
-                                if offset + chunk_size > *hashed_offset && *hashed_offset >= offset
-                                {
-                                    let new_part_start_at = *hashed_offset - offset;
-                                    let new_part_size = (offset + chunk_size) - *hashed_offset;
-                                    hasher.update(
-                                        &buf.0[new_part_start_at as usize
-                                            ..(new_part_start_at + new_part_size) as usize],
-                                    );
-                                    if offset + chunk_size == real_file_size {
-                                        let hash: [u8; CHECKSUM_SIZE] =
-                                            hasher.finalize().as_bytes()[0..16].try_into().unwrap();
-                                        *cksumstate = ChecksummingState::Finished(hash);
-                                    }
-                                }
+
+                match (kind, &source) {
+                    (Kind::Normal, OwnedSource::Path(path)) => {
+                        let mut file = compio::fs::File::open(&path).await?;
+                        buf = match file
+                            .read_exact_at(
+                                BytesMutTake(buf, buflen, buflen + chunk_size as usize),
+                                offset,
+                            )
+                            .await
+                            .into_parts()
+                        {
+                            (Ok(_), mut buf) => {
+                                buf.0
                             }
-                            ChecksummingState::Finished(_) => {}
-                        }
-                        if offset + chunk_size == real_file_size {
-                            buf.0.reserve(CHECKSUM_SIZE);
-                            buf.0.extend_from_slice(
-                                &self.get_checksum(&path, real_file_size).await?,
-                            );
-                        }
-                        if task_i + 1 == task_len || buf.0.len() >= PAYLOAD_SIZE_USIZE {
-                            let pktbuf =
-                                buf.0.split_to(PAYLOAD_SIZE_USIZE.min(buf.0.len())).freeze();
-                            tx(Payload {
-                                session_id: session_id,
-                                retransmit_generation: logical_time,
-                                index: output_idx.start,
-                                eof_approaching: task_i + PRE_REQUEST_TIME > task_len,
-                                data: pktbuf,
-                            })
-                            .await;
-                            output_idx.start.0 += 1;
-                        }
-                        buf.0
+                            (Err(err), mut _buf) => {
+                                panic!("Failed reading file: {}: {:?}", path.display(), err);
+                            }
+                        };
+
                     }
-                    (Err(err), mut _buf) => {
-                        panic!("Failed reading file: {}: {:?}", path.display(), err);
+                    (Kind::Symlink, OwnedSource::Path(path)) => {
+                        let link = std::fs::read_link(&path)?;
+                        let linkbytes= link.to_string_lossy();
+                        let linkbuf = linkbytes.as_bytes();
+                        assert_eq!(linkbuf.len() as u64, real_file_size);
+                        buf.extend_from_slice(&linkbuf[offset as usize .. offset as usize + chunk_size as usize]);
                     }
+                    (Kind::FileSet, OwnedSource::FileSet(fileset)) => {
+                        assert_eq!(fileset.len() as u64, real_file_size);
+                        buf.extend_from_slice(&fileset[offset as usize .. offset as usize + chunk_size as usize]);
+                    }
+                    x => {
+                        unreachable!("unsupported read operation: {:?}", x)
+                    }
+                }
+
+                //TODO: source.to_owned() allocates, fix that!
+                let cksumstate = match self.checksums.get_mut(&source.to_owned_id()) {
+                    Some(cksum) => cksum,
+                    None => self.checksums.entry(source.to_owned_id()).or_default(),
                 };
+
+                match cksumstate {
+                    ChecksummingState::Hashing {
+                        hasher,
+                        offset: hashed_offset,
+                    } => {
+                        if offset + chunk_size > *hashed_offset && *hashed_offset >= offset
+                        {
+                            let new_part_start_at = *hashed_offset - offset;
+                            let new_part_size = (offset + chunk_size) - *hashed_offset;
+                            hasher.update(
+                                &buf[new_part_start_at as usize
+                                    ..(new_part_start_at + new_part_size) as usize],
+                            );
+                            if offset + chunk_size == real_file_size {
+                                let hash: [u8; CHECKSUM_SIZE] =
+                                    hasher.finalize().as_bytes()[0..16].try_into().unwrap();
+                                *cksumstate = ChecksummingState::Finished(hash);
+                            }
+                        }
+                    }
+                    ChecksummingState::Finished(_) => {}
+                }
+                if offset + chunk_size == real_file_size {
+                    buf.reserve(CHECKSUM_SIZE);
+                    let source = source.to_owned();
+                    buf.extend_from_slice(
+                        &self.get_checksum(&source, real_file_size).await?,
+                    );
+                }
+                if task_i + 1 == task_len || buf.len() >= PAYLOAD_SIZE_USIZE {
+                    let pktbuf =
+                        buf.split_to(PAYLOAD_SIZE_USIZE.min(buf.len())).freeze();
+                    trace!("server emitting payload: {} bytes", pktbuf.len());
+                    tx(Payload {
+                        session_id: session_id,
+                        retransmit_generation: logical_time,
+                        index: output_idx.start,
+                        eof_approaching: task_i + PRE_REQUEST_TIME > task_len,
+                        data: pktbuf,
+                    })
+                    .await;
+                    output_idx.start.0 += 1;
+                }
+
             }
 
             Ok(())
@@ -676,32 +752,44 @@ mod disk_read_engine {
                 && phase_offset >= max_index_of_phase
                 && phase as usize != self.files.num_phases()
             {
-                return PacketIdx::new(phase + 1, PhaseOffset::ZERO);
+                return PacketIdx::new(phase + 1, IndexInPhase::ZERO);
             }
-            PacketIdx::new(phase, PhaseOffset(index.index().0 + 1))
+            PacketIdx::new(phase, IndexInPhase(index.index().0 + 1))
         }
 
         async fn get_checksum(
             &mut self,
-            p0: &Path,
+            source: &OwnedSource,
             real_file_size: u64,
         ) -> Result<[u8; CHECKSUM_SIZE]> {
-            let cksum = self.checksums.entry(p0.to_path_buf()).or_default();
-            match cksum {
+            let mut cksum = self.checksums.get_mut(&source.to_owned_id());
+            if cksum.is_none() {
+                cksum = Some(self.checksums.entry(source.to_owned_id()).or_default());
+            }
+            match cksum.as_mut().unwrap() {
                 ChecksummingState::Hashing { hasher, offset } => {
-                    let f = File::open(p0).await?;
-                    let mut vec = vec![0; READ_ENGINE_BUF_SIZE];
-                    while *offset < real_file_size {
-                        let to_read = (real_file_size - *offset).min(READ_ENGINE_BUF_SIZE as u64);
-                        vec.resize(to_read as usize, 0);
-                        vec = match f.read_exact_at(vec, *offset).await.into_parts() {
-                            (Ok(_), buf) => {
-                                hasher.update(&buf);
-                                *offset += buf.len() as u64;
-                                buf
+
+                    match source {
+                        OwnedSource::Path(path) => {
+                            let f = File::open(path).await?;
+
+                            let mut vec = vec![0; READ_ENGINE_BUF_SIZE];
+                            while *offset < real_file_size {
+                                let to_read = (real_file_size - *offset).min(READ_ENGINE_BUF_SIZE as u64);
+                                vec.resize(to_read as usize, 0);
+                                vec = match f.read_exact_at(vec, *offset).await.into_parts() {
+                                    (Ok(_), buf) => {
+                                        hasher.update(&buf);
+                                        *offset += buf.len() as u64;
+                                        buf
+                                    }
+                                    (Err(err), _) => bail!("failed to read file {}", err), //TODO: Better error
+                                };
                             }
-                            (Err(err), _) => bail!("failed to read file {}", err), //TODO: Better error
-                        };
+                        }
+                        OwnedSource::FileSet(buf) => {
+                            hasher.update(buf);
+                        }
                     }
                     Ok(hasher.finalize().as_bytes()[0..CHECKSUM_SIZE]
                         .try_into()
@@ -732,7 +820,8 @@ mod server {
     use rangemap::RangeMap;
     use savefile::Serialize;
     use smallvec::SmallVec;
-    use crate::util::reusable_multicast_socket;
+    use tracing::{debug, error, info, trace};
+    use crate::util::{reusable_multicast_socket, unicast_socket};
 
     #[derive(Clone, Debug)]
     pub struct ServerConfig {
@@ -757,7 +846,8 @@ mod server {
         config: ServerConfig,
         logic_state: ServerLogicState,
         session_id: SessionId,
-        socket: Arc<compio::net::UdpSocket>,
+        multicast_socket: Arc<compio::net::UdpSocket>,
+        unicast_socket: Arc<compio::net::UdpSocket>,
     }
 
     struct Pacing {
@@ -799,8 +889,9 @@ mod server {
         packet_leader_position: PacketIdx,
         pack_leader_last_head: Instant,
         pacing: Pacing,
-        meta: Meta,
-        socket: Arc<compio::net::UdpSocket>,
+
+        multicast_socket: Arc<compio::net::UdpSocket>,
+        unicast_socket: Arc<compio::net::UdpSocket>,
     }
 
     impl ServerLogicState {
@@ -818,6 +909,7 @@ mod server {
                     r.end.0 -= overshot as u64;
                     r_size = budget;
                 }
+                trace!("Ordering backend to send {:?}: {:?}", generation, r);
 
                 self.tx
                     .send((generation, r))
@@ -839,16 +931,19 @@ mod server {
             if self.pack_leader != src && first_idx < self.packet_leader_position
                 || self.pack_leader_last_head.elapsed() > PACK_LEADER_CHANGE_TIME
             {
-                println!("pack leader changed to {}", src);
+                debug!("pack leader changed to {}", src);
                 self.pack_leader = src;
                 self.packet_leader_position = first_idx;
             }
 
             if r.retransmit_generation.0 != self.current_retransmit_generation.0 + 1 {
+                trace!("ignore retransmit generation {} because current is {}",
+                    r.retransmit_generation.0, self.current_retransmit_generation.0);
                 return Ok(());
             }
 
             if self.pack_leader != src {
+                trace!("peer {:?} is not pack leader {:?}. ", src, self.pack_leader);
                 return Ok(());
             }
             self.pack_leader_last_head = Instant::now();
@@ -865,6 +960,7 @@ mod server {
                     }
                 }
             }
+
             self.send(
                 r.retransmit_generation,
                 r.sections.into_iter().map(|offset_range| {
@@ -874,21 +970,7 @@ mod server {
             );
             Ok(())
         }
-        async fn process_request_announce(&mut self, dst: SocketAddr) -> Result<()> {
-            let mut buf = BytesMut::new();
-            Message::Announce(Announce {
-                session_id: self.session_id,
-                retransmit_generation: self.current_retransmit_generation,
-                fileset_size: self.meta.fileset_buf.len() as u64,
-                phases: self.meta.phases + 1,
-                file_count: self.meta.file_count,
-                total_size_bytes: self.meta.total_size_bytes,
-            }).msg_serialize(&mut buf);
 
-            self.socket.send_to(buf, dst).await.0?;
-
-            Ok(())
-        }
         async fn receive_message(&mut self, input: Bytes, src: SocketAddr) -> Result<()> {
             let msg = Message::msg_deserialize(input)?;
             if let Some(msg_session_id) = msg.session_id()
@@ -898,13 +980,13 @@ mod server {
             }
             match msg {
                 Message::Request(r) => {
+                    trace!("server received request {:?}", r);
                     self.process_request(r, src)?;
                 }
                 Message::Payload(_) => {}
                 Message::Announce(_) => {}
                 Message::RequestAnnounce => {
-                    println!("Server got announce request");
-                    self.process_request_announce(src).await?;
+                    error!("Server got announce request on unicast");
                 }
             }
 
@@ -913,7 +995,26 @@ mod server {
     }
 
     impl ServerState {
-        pub async fn worker(
+        async fn process_request_announce(
+            session_id: SessionId,
+            unicast_socket: &UdpSocket, dst: SocketAddr, meta: &Meta) -> Result<()> {
+            let mut buf = BytesMut::new();
+            let msg =Message::Announce(Announce {
+                session_id: session_id,
+                fileset_size: meta.fileset_buf.len() as u64,
+                phases: meta.phases,
+                file_count: meta.file_count,
+                total_size_bytes: meta.total_size_bytes,
+            });
+            trace!("server sending announce: {:?} to {:?}", msg, dst);
+            msg.msg_serialize(&mut buf);
+
+            unicast_socket.send_to(buf, dst).await.0?;
+
+            Ok(())
+        }
+
+        pub async fn file_fetching_worker(
             rx: flume::Receiver<(RetransmitGeneration, Range<PacketIdx>)>,
             session_id: SessionId,
             config: ServerConfig,
@@ -922,16 +1023,21 @@ mod server {
         ) -> Result<()> {
 
             spawn(async move {
-                let mut buf = Some(BytesMut::new());
+                let mut buf = Some(BytesMut::with_capacity(MTU_USIZE));
                 loop {
 
                     let Ok((generation, pkts)) = rx.recv_async().await else {
+                        info!("worker exiting");
                         return;
                     };
+                    trace!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
                     let result = read_engine
                         .get_packets(generation, session_id, pkts, async |pkt| {
                             let mut buf_inner = buf.take().expect("buffer is always returned");
-                            Message::Payload(pkt).msg_serialize(&mut buf_inner);
+                            let msg = Message::Payload(pkt);
+                            buf_inner.clear();
+                            msg.msg_serialize(&mut buf_inner);
+                            trace!("server sending {} byte payload: {:?}", buf_inner.len(), msg);
 
                             buf = Some(
                                 match socket
@@ -947,15 +1053,16 @@ mod server {
                                         buf_inner
                                     }
                                     (Err(err), buf) => {
-                                        eprintln!("socket transmit failed: {:?}", err);
+                                        error!("socket transmit failed: {:?}", err);
                                         buf_inner
                                     }
                                 },
                             );
                         })
                         .await;
+                    trace!("file fetching worker done");
                     if let Err(err) = result {
-                        eprintln!("disk access failed {:?}", err);
+                        error!("disk access failed {:?}", err);
                     }
                 }
             })
@@ -967,9 +1074,13 @@ mod server {
             let (tx, rx) = flume::unbounded();
             let session_id = SessionId::make_random();
 
+            let unicast_socket = Arc::new(unicast_socket(config.local_iface)?);
             let main_socket = Arc::new(reusable_multicast_socket(config.mcast_addr, config.local_iface)?);
 
-            let files = FileSet::new(config.phases.clone())?;
+            info!("collecing file list");
+            let mut files = FileSet::new(config.phases.clone())?;
+
+            info!("Full Fileset: {:#?}", files);
 
             let mut state = ServerState {
                 config,
@@ -982,39 +1093,78 @@ mod server {
                     packet_leader_position: PacketIdx(0),
                     pack_leader_last_head: Instant::now(),
                     pacing: Pacing::default(),
-                    meta: files.meta()?,
-                    socket: main_socket.clone(),
+                    unicast_socket: unicast_socket.clone(),
+                    multicast_socket: main_socket.clone(),
                 },
                 //TODO: don't store sessionid twice
                 session_id,
-                socket: main_socket.clone(),
+                multicast_socket: main_socket.clone(),
+                unicast_socket: unicast_socket.clone(),
             };
 
-            let mut buf = BytesMut::with_capacity(MTU_USIZE);
+            let meta = files.calculate_meta_and_assign_fileset_buf()?;
 
             let re = ReadEngine::new(state.session_id, files).await;
 
-            Self::worker(rx, session_id, state.config.clone(), re, main_socket.clone()).await?;
+            info!("starting file fetching worker");
+            Self::file_fetching_worker(rx, session_id, state.config.clone(), re, main_socket.clone()).await?;
 
+
+            spawn(async move{
+                let mut buf = BytesMut::with_capacity(MTU_USIZE);
+                loop {
+                    debug!("Server calling socket.recv_from on multicast socket");
+                    buf.clear();
+                    buf.reserve(MTU_USIZE);
+                    buf = match main_socket.recv_from(buf).await.into_parts() {
+                        (Ok((size, src)), mut rbuf) => {
+                            trace!("server received {}/{} byte packet on multicast: {:?}", size, rbuf.len(), rbuf);
+                            assert_eq!(size, rbuf.len());
+                            let msg = Message::msg_deserialize(rbuf.split().freeze()).expect("corrupt message"); //TODO: Fix error hadnling
+                            match msg {
+                                Message::RequestAnnounce => {
+                                    Self::process_request_announce(session_id, &unicast_socket, src, &meta).await.expect("process request announce"); //TODO: Fix error hadnling
+                                }
+                                _ => {
+                                    debug!("received non-announce-request on multicast socket.");
+                                }
+                            }
+                            rbuf
+                        }
+                        (Err(err), rbuf) => {
+                            error!("socket error: {:?}", err);
+                            compio::time::sleep(Duration::from_secs(1)).await;
+                            rbuf
+                        }
+                    };
+                }
+            }).detach();
+
+
+            //TODO: Move to other method
+            let mut buf = BytesMut::with_capacity(MTU_USIZE);
             loop {
-                println!("Server calling socket.recv_from");
-                buf = match state.socket.recv_from(buf).await.into_parts() {
-                    (Ok((size, src)), rbuf) => {
-
+                debug!("Server calling socket.recv_from");
+                buf.clear();
+                buf.reserve(MTU_USIZE);
+                buf = match state.unicast_socket.recv_from(buf).await.into_parts() {
+                    (Ok((size, src)), mut rbuf) => {
+                        trace!("server received {}/{} byte packet", size, rbuf.len());
+                        assert_eq!(size, rbuf.len());
                         match state
                             .logic_state
-                            .receive_message(rbuf.clone().freeze(), src).await
+                            .receive_message(rbuf.split().freeze(), src).await
                         {
                             Ok(()) => {
                             }
                             Err(err) => {
-                                eprintln!("failed to process incoming message {:?}", err);
+                                error!("failed to process incoming message {:?}", err);
                             }
                         }
                         rbuf
                     }
                     (Err(err), rbuf) => {
-                        eprintln!("socket error: {:?}", err);
+                        error!("socket error: {:?}", err);
                         compio::time::sleep(Duration::from_secs(1)).await;
                         rbuf
                     }
@@ -1025,30 +1175,33 @@ mod server {
 }
 
 mod client {
-    use crate::file_set::FileSet;
+    use crate::file_set::{AtomicChecksum, FileSet};
     use crate::messages::{LinkQualitySignal, Message, Request};
-    use crate::{Bytes, PhaseOffset, SessionId, MTU_USIZE, PacketIdx, calculate_phase_offset, RetransmitGeneration, DEFAULT_BIND_ADDRESS, DEFAULT_MCAST_ADDR};
-    use anyhow::{Result, bail};
+    use crate::{Bytes, PhaseOffset, SessionId, MTU_USIZE, PacketIdx, calculate_phase_offset, RetransmitGeneration, DEFAULT_BIND_ADDRESS, DEFAULT_MCAST_ADDR, CHECKSUM_SIZE_U64, CHECKSUM_SIZE, contains};
+    use anyhow::{anyhow, bail, Result, Context};
     use compio::bytes::{Buf, BufMut, BytesMut};
     use compio::net::UdpSocket;
     use savefile::{Deserialize, Deserializer, Serialize};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::ops::Range;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use arrayvec::ArrayVec;
     use compio::fs::{File, OpenOptions};
     use compio::io::AsyncWriteAtExt;
     use compio::runtime::{spawn, JoinHandle};
+    use flume::Receiver;
     use futures_util::stream::FuturesUnordered;
     use indexmap::IndexSet;
     use rangemap::RangeSet;
-    use crate::util::reusable_multicast_socket;
+    use tracing::{debug, error, info, trace};
+    use crate::util::{reusable_multicast_socket, unicast_socket};
 
     pub struct ClientConfig {
-        paths: Vec<PathBuf>,
-        bind_address: Ipv4Addr,
-        mcast_addr: SocketAddrV4,
+        pub paths: Vec<PathBuf>,
+        pub bind_address: Ipv4Addr,
+        pub mcast_addr: SocketAddrV4,
     }
 
     impl Default for ClientConfig {
@@ -1079,17 +1232,21 @@ mod client {
     }
     pub struct ClientState {
         state: ClientStateEnum,
-        main_socket: UdpSocket,
+        recv_socket: UdpSocket,
+        send_socket: UdpSocket,
         config: ClientConfig,
     }
 
     trait BlockReceiver {
-        async fn write(&mut self, dest: PacketIdx, data: Bytes) -> Result<()>;
+        async fn write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()>;
 
     }
 
     enum DiskWriteCommand {
-        Write(PacketIdx, Bytes),
+        /// The Range is the completely transferred range that this write is a part of.
+        ///
+        /// The completeness assumes this write has occurred.
+        Write(PacketIdx, Bytes, Range<PhaseOffset> /*completed subpart*/),
     }
     struct FileSetDiskWriter {
         jhs: Vec<JoinHandle<Result<()>>>,
@@ -1116,15 +1273,43 @@ mod client {
     }
 
     pub const WRITE_BUFFER_SIZE_PACKETS: usize = 100;
+    pub const HASHER_BUFFER_SIZE_PACKETS: usize = 100;
     pub const WRITE_WORKERS: usize = 20;
 
     impl FileSetDiskWriter {
-        pub fn new(
-            paths: Vec<PathBuf>,
+        pub async fn new(
             fileset: FileSet) -> FileSetDiskWriter {
 
             let fileset = Arc::new(fileset);
             let (tx,rx) = flume::bounded(WRITE_BUFFER_SIZE_PACKETS);
+
+            let (hasher_tx, hasher_rx) = flume::bounded(HASHER_BUFFER_SIZE_PACKETS);
+
+            let mut jhs = Vec::new();
+
+            //TODO: Monitor join-handles and exit early when anything fails
+            for _ in 0..WRITE_WORKERS {
+                let hasher_rx: Receiver<(AtomicChecksum, PathBuf)> = hasher_rx.clone();
+                jhs.push(spawn(async move {
+                    loop{
+                        let Ok((sum, path)) = hasher_rx.recv_async().await else {
+                            break;
+                        };
+                        let hash : [u8;CHECKSUM_SIZE] = blake3::Hasher::new()
+                            .update_mmap_rayon(&path).with_context(||anyhow!("checksumming file {}", path.display()))?   // mmaps the file + hashes it multithreaded
+                            .finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
+                        if hash != sum.bytes() {
+                            // TODO: better error handling?
+                            panic!("Hash mismatch for {}. Should: {:?}, was: {:?}", path.display(),
+                                sum.bytes(), hash
+                            );
+                        }
+
+                    }
+                    Ok(())
+                }));
+
+            }
 
             struct CurFile {
                 path: PathBuf,
@@ -1132,49 +1317,98 @@ mod client {
                 phase: u16,
             }
 
-            let mut jhs = Vec::new();
             for _ in 0..WRITE_WORKERS {
                 let rx = rx.clone();
                 let fileset = fileset.clone();
                 let mut curfile : Option<CurFile> = None;
-                let paths = paths.clone();
+                let mut hasher_tx = hasher_tx.clone();
+
                 jhs.push(spawn(async move {
                     // TODO: error handling
 
                     let mut cursor = fileset.make_cursor();
 
                     loop {
-                        let Ok(ev) = rx.recv() else {
+                        let Ok(ev) = rx.recv_async().await else {
                             return Ok(());
                         };
                         match ev {
-                            DiskWriteCommand::Write(idx, bytes) => {
+                            // TODO: Buffer recycling?
+                            DiskWriteCommand::Write(input_idx, mut bytes, completed_range) => {
                                 //TODO: Error handling!
-                                let need = cursor.seek(idx.phase(), calculate_phase_offset(idx.index()))?;
-                                if let Some(curfile_inner) = curfile.as_mut() {
-                                    if curfile_inner.path != need.path || curfile_inner.phase != idx.phase() {
-                                        curfile = None;
-                                    }
-                                }
-                                if curfile.is_none() {
-                                    let path = paths[idx.phase() as usize  -1 ].join(need.path).to_path_buf();
-                                    curfile = Some(CurFile {
-                                        path: path.clone(),
-                                        file: OpenOptions::new().write(true).create(true).open(path).await?,
-                                        phase: idx.phase(),
-                                    });
-                                }
-                                assert!(need.file_offset + bytes.len() as u64 <= need.file_size);
+                                let input_phase = input_idx.phase();
+                                let mut cur_phase_offset = calculate_phase_offset(input_idx.index());
+                                let mut end_phase_offset = cur_phase_offset + bytes.len() as u64;
 
-                                let curfile = curfile.as_mut().unwrap();
-                                match curfile.file.write_all_at(bytes, need.file_offset).await.into_parts() {
-                                    (Ok(_), _buf) => {
+                                while cur_phase_offset != end_phase_offset {
 
-                                    },
-                                    (Err(e), buf) => {
-                                        bail!("Failed to write file: {:?}", e);
+                                    trace!("Processing phase {} {} byte write at {:?} (cur phase_offset.end: {:?})", input_phase, bytes.len(), cur_phase_offset, end_phase_offset);
+
+                                    let need = cursor.seek(input_phase, cur_phase_offset)?;
+                                    if let Some(curfile_inner) = curfile.as_mut() {
+                                        if curfile_inner.path != need.path || curfile_inner.phase != input_phase {
+                                            curfile = None;
+                                        }
                                     }
-                                };
+                                    if curfile.is_none() {
+
+                                        let path = need.path.to_path_buf();
+
+                                        if let Some(parent) = path.parent() {
+                                            std::fs::create_dir_all(parent)?;
+                                        }
+
+                                        curfile = Some(CurFile {
+                                            path: path.clone(),
+                                            file: OpenOptions::new().write(true).create(true).open(&path).await.with_context(
+                                                ||format!("Opening file for writing {}", path.display()))?,
+                                            phase: input_phase,
+                                        });
+                                    }
+
+
+                                    let mut bytes_now = if  bytes.len() as u64 > need.file_size - need.file_offset {
+                                        bytes.split_to(need.file_size as usize - need.file_offset as usize)
+                                    } else {
+                                        bytes.split_to(bytes.len())
+                                    };
+
+                                    let bytes_now_progress = bytes_now.len();
+
+
+                                    let curfile = curfile.as_mut().unwrap();
+                                    let checksum_bytes = (need.file_offset + bytes_now.len() as u64).saturating_sub(need.file_size - CHECKSUM_SIZE_U64);
+
+                                    if checksum_bytes > 0 {
+                                        let checksum_byte_ref = &bytes_now[bytes_now.len()-checksum_bytes as usize..];
+                                        let checksum_offset = need.file_offset.saturating_sub(need.file_size - CHECKSUM_SIZE_U64);
+                                        trace!("Interpreting bytes at {:?} as checksum bytes for {:?}",
+                                            cur_phase_offset, need.path.display()
+                                        );
+                                        need.checksum.partial_update(checksum_offset as usize, checksum_byte_ref);
+                                        _ = bytes_now.split_off(bytes_now.len() - checksum_bytes as usize);
+                                    }
+
+                                    match curfile.file.write_all_at(bytes_now, need.file_offset).await.into_parts() {
+                                        (Ok(_), _buf) => {
+
+                                        },
+                                        (Err(e), buf) => {
+                                            bail!("Failed to write file: {:?}", e);
+                                        }
+                                    };
+
+                                    if contains(completed_range.clone(), need.file_range.clone()) {
+                                        trace!("detected that file {} was complet, because completed range is {:?} and file range is {:?}", need.path.display(), completed_range, need.file_range);
+                                        hasher_tx.send_async((need.checksum.clone(), need.path.to_path_buf())).await.expect("hashers do not die");
+                                    }
+
+                                    cur_phase_offset.0 += bytes_now_progress as u64;
+
+                                }
+
+
+
                             }
                         }
                     }
@@ -1190,19 +1424,20 @@ mod client {
     }
 
     impl BlockReceiver for FileSetDiskWriter {
-        async fn write(&mut self, dest: PacketIdx, data: Bytes) -> Result<()> {
-            Ok(self.tx.send_async(DiskWriteCommand::Write(dest, data)).await?)
+        async fn write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
+            Ok(self.tx.send_async(DiskWriteCommand::Write(dest, data, completed_range)).await?)
         }
 
     }
 
 
     impl BlockReceiver for Vec<u8> {
-        async fn write(&mut self, dest: PacketIdx, data: Bytes) -> Result<()> {
+        async fn write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
             if dest.phase() != 0 {
                 bail!("wrong phase for initialization");
             }
             let dest = calculate_phase_offset(dest.index());
+            trace!("block size: {}, dest: {}", self.len(), dest.0);
             self[dest.0 as usize .. dest.0 as usize + data.len()].copy_from_slice(&data);
             Ok(())
         }
@@ -1220,13 +1455,14 @@ mod client {
                           session_id: SessionId,
                           //TODO: Move sockets into some abstraction
                           recv_socket: &UdpSocket,
+                          send_socket: &UdpSocket,
                           mut receiver: &mut impl BlockReceiver,
                           phases: &[(u16/*phase*/, PhaseOffset/*size*/)],
                           peer: SocketAddrV4,
 
         ) -> Result<()> {
-            let mut recvbuf = BytesMut::new();
 
+            /// Missing range per phase
             let mut missing = vec![];
             for (phase,phase_size) in phases.iter().copied() {
                 if missing.len() < phase as usize + 1 {
@@ -1242,7 +1478,9 @@ mod client {
             async fn send_request(mut buf: BytesMut, send_socket: &UdpSocket, phase: u16, session_id: SessionId, missing: &RangeSet<PhaseOffset>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4) -> Result<BytesMut> {
                 let mut sections = ArrayVec::new();
                 for rng in missing.iter() {
-                    if sections.try_push(rng.clone()).is_err() {
+                    let start = rng.start.floor_index();
+                    let end = rng.end.ceil_index();
+                    if sections.try_push(start..end).is_err() {
                         break;
                     }
                 }
@@ -1254,6 +1492,7 @@ mod client {
                     sections
                 });
                 buf.clear();
+                trace!("sending request: {:?} to {:?}", request, dst);
                 request.msg_serialize(&mut buf);
                 Ok(match send_socket.send_to(buf, dst).await.into_parts() {
                     (Ok(size), buf) => {
@@ -1272,15 +1511,22 @@ mod client {
             let mut loss: LinkQualitySignal = LinkQualitySignal::KeepGoing;
             let mut no_loss_counter = 0;
             for (phase, phase_size) in phases {
+                let mut recvbuf = BytesMut::new();
                 'phaseloop: loop {
+                    recvbuf.clear();
+                    recvbuf.reserve(MTU_USIZE);
 
-                    let r = compio::time::timeout(Duration::from_millis(50), recv_socket.recv(recvbuf.clone())).await;
+                    debug!("working on phase {} in client", phase);
+                    let r = compio::time::timeout(Duration::from_millis(50), recv_socket.recv(recvbuf)).await;
+                    debug!("client socket call completed or timed out");
+
 
                     let msg = match r {
                         Ok(msg) => msg,
                         Err(_elapsed) => {
+                            trace!("client experienced idle server");
                             let phase_missing = &missing[*phase as usize];
-                            sendbuf = send_request(sendbuf,&recv_socket, *phase, session_id,
+                            sendbuf = send_request(sendbuf,&send_socket, *phase, session_id,
                                                    phase_missing, last_retransmit_generation, loss, peer
                             ).await?;
                             loss = LinkQualitySignal::KeepGoing;
@@ -1290,14 +1536,17 @@ mod client {
                     };
 
                     recvbuf = match msg.into_parts() {
-                        (Ok(_), buf) => {
+                        (Ok(size), buf) => {
+                            assert_eq!(size, buf.len());
+                            trace!("client received {}/{} byte message", buf.len(), size);
                             let msg = Message::msg_deserialize(buf.clone().freeze())?;
                             if let Some(msg_session_id) = msg.session_id() && msg_session_id != session_id {
                                 // wrong session id
                             } else {
                                 match msg {
                                     Message::Request(_) => {
-                                        eprintln!("ignore request");
+                                        //TODO: Cleanup
+                                        error!("ignore request");
                                     }
                                     Message::Payload(p) => {
                                         let range_start = calculate_phase_offset(p.index.index());
@@ -1312,7 +1561,7 @@ mod client {
                                             was_useful = true;
                                         }
 
-                                        phase_missing.remove(range);
+                                        phase_missing.remove(range.clone());
                                         let holes_after = phase_missing.len();
                                         if holes_after != holes_before {
                                             loss = LinkQualitySignal::LossDetected;
@@ -1325,27 +1574,35 @@ mod client {
                                             }
                                         }
 
-                                        receiver.write(p.index, p.data).await?;
+                                        let gap_end = phase_missing.overlapping(range.end..PhaseOffset::MAX_OFFSET).next().cloned().unwrap_or(range.start..PhaseOffset::MAX_OFFSET);
+                                        let gap_start = phase_missing.overlapping(PhaseOffset(0)..range.start).rev().next().cloned().unwrap_or(PhaseOffset(0)..range.end);
+                                        trace!("search for missing tree: {:?}", phase_missing);
+                                        trace!("search for missing after {:?} got {:?}", range.end, gap_end);
+                                        trace!("search for missing before {:?} got {:?}", range.start, gap_start);
+                                        let gap = gap_start.end..gap_end.start;
+
+                                        receiver.write(p.index, p.data, gap).await?;
 
                                         if was_useful {
                                             if phase_missing.is_empty() {
+                                                debug!("Client exiting phase loop for phase {}", phase);
                                                 break 'phaseloop;
                                             }
                                         }
 
                                     }
                                     Message::Announce(_) => {
-                                        eprintln!("ignore announce");
+                                        error!("ignore announce");
                                     }
                                     Message::RequestAnnounce => {
-                                        eprintln!("ignore request announce");
+                                        error!("ignore request announce");
                                     }
                                 }
                             }
                             buf
                         }
-                        (Err(e), buf) => {
-                            bail!("receive failed");
+                        (Err(e), _buf) => {
+                            bail!("receive failed: {:?}", e);
                         }
                     };
                 }
@@ -1359,11 +1616,15 @@ mod client {
 
     impl ClientState {
         pub async fn new(config: ClientConfig) -> Result<ClientState> {
+            let send_socket = unicast_socket(config.bind_address)?;
             let recv_socket = reusable_multicast_socket(config.mcast_addr, config.bind_address)?;
+
+            info!("client bound to socket {:?}", send_socket.local_addr()?);
 
             Ok(ClientState {
                 state: ClientStateEnum::Initializing,
-                main_socket: recv_socket,
+                recv_socket,
+                send_socket,
                 config,
             })
         }
@@ -1375,58 +1636,63 @@ mod client {
             loop {
                 let mut buf = BytesMut::new();
                 req.msg_serialize(&mut buf);
-                self.main_socket
+                trace!("sending request for announcement to {:?}", self.config.mcast_addr);
+                self.send_socket
                     .send_to(buf, self.config.mcast_addr)
                     .await
                     .into_parts()
                     .0?;
+                let timeout = Instant::now() + Duration::from_secs(1);;
 
-                match compio::time::timeout(
-                    Duration::from_secs(1),
-                    self.main_socket.recv_from(BytesMut::with_capacity(MTU_USIZE)),
-                )
-                .await
-                {
-                    Ok(x) => match x.into_parts() {
+                while Instant::now() < timeout {
+                    match compio::time::timeout_at(
+                        timeout,
+                        self.send_socket.recv_from(BytesMut::with_capacity(MTU_USIZE)),
+                    )
+                        .await
+                    {
+                        Ok(x) => match x.into_parts() {
 
-                        (Ok((size, SocketAddr::V4(src))), mut buf) => {
-                            println!("Client received {} byte message", size);
-                            let msg = Message::msg_deserialize(buf.freeze())?;
-                            match msg {
-                                Message::Request(_) => {}
-                                Message::Payload(_) => {}
-                                Message::Announce(a) => {
-                                    return Ok((a.session_id, a.fileset_size, a.phases, src));
+                            (Ok((size, SocketAddr::V4(src))), mut buf) => {
+                                debug!("Client received {} byte message: {:?} from {:?}", size, buf, src);
+                                let msg = Message::msg_deserialize(buf.freeze())?;
+                                debug!("Client received msg: {:?}", msg);
+                                match msg {
+                                    Message::Request(_) => {}
+                                    Message::Payload(_) => {}
+                                    Message::Announce(a) => {
+                                        return Ok((a.session_id, a.fileset_size, a.phases, src));
+                                    }
+                                    Message::RequestAnnounce => {}
                                 }
-                                Message::RequestAnnounce => {}
                             }
+                            (Ok(_), _) => {
+                                bail!("unexpected message protocol")
+                            }
+                            (Err(err), _) => {
+                                bail!("failed receiving message: {:?}", err)
+                            }
+                        },
+                        Err(_err) => {
+                            debug!("timeout waiting for announce");
                         }
-                        (Ok(_), _) => {
-                            bail!("unexpected message protocol")
-                        }
-                        (Err(err), _) => {
-                            bail!("failed receiving message: {:?}", err)
-                        }
-                    },
-                    Err(_err) => {
-                        println!("timeout waiting for announce");
                     }
                 }
-
-                compio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
 
         pub async fn run(&mut self) -> Result<()> {
+            info!("client main loop starting");
             loop {
                 match std::mem::replace(&mut self.state,  ClientStateEnum::Invalid) {
                     ClientStateEnum::Initializing => {
+                        info!("client initializing");
                         let (session_id, fileset_size, phases, server) = self.init_session().await?;
                         if phases as usize != self.config.paths.len() + 1 {
                             bail!("need {} paths, because there are {} phases, not {}", phases-1, phases-1, self.config.paths.len());
                         }
 
-                        let buf = vec![0; fileset_size as usize];
+                        let buf = vec![0; fileset_size as usize + CHECKSUM_SIZE];
                         self.state = ClientStateEnum::AwaitingFileSet {
                             session_id,
                             buf,
@@ -1435,15 +1701,27 @@ mod client {
                         };
                     }
                     ClientStateEnum::AwaitingFileSet { session_id, phases, server, mut buf } => {
+                        info!("client loading fileset");
                         let phase_0_size = buf.len();
-                        ClientProtocolHandler::sync(session_id, &self.main_socket,
+                        ClientProtocolHandler::sync(session_id, &self.recv_socket, &self.send_socket,
                                                     &mut buf, &[(0,PhaseOffset(phase_0_size as u64))], server
                         ).await?;
 
-                        let fileset: FileSet = Deserializer::bare_deserialize(&mut buf.reader(), 0)?;
-                        let phases = fileset.get_phases();
+                        let checksum = blake3::hash(&buf[..buf.len()-CHECKSUM_SIZE]).as_bytes()[0..16].to_vec();
+                        if &checksum != &buf[buf.len()-CHECKSUM_SIZE..] {
+                            bail!("Checksum mismatch - network corruption?");
+                        }
 
-                        let writer = FileSetDiskWriter::new(self.config.paths.clone(), fileset);
+                        let mut fileset: FileSet = Deserializer::bare_deserialize(&mut buf.reader(), 0)?;
+
+                        fileset.replace_phase_paths(&self.config.paths)?;
+
+                        let phases = fileset.get_phases_excluding_first_phase();
+
+
+                        let writer = FileSetDiskWriter::new(fileset).await;
+
+
 
                         self.state = ClientStateEnum::Receiving {
                             fileset: writer,
@@ -1453,14 +1731,15 @@ mod client {
                         };
                     }
                     ClientStateEnum::Receiving { phases, mut  fileset, session_id, server } => {
+                        info!("client receiving actual files, phases = {:?}", phases);
 
-                        ClientProtocolHandler::sync(session_id,  &self.main_socket,
+                        ClientProtocolHandler::sync(session_id, &self.recv_socket, &self.send_socket,
                                                     &mut fileset, &phases, server
                         ).await?;
 
-                        fileset.shutdown().await;
+                        fileset.shutdown().await?;
 
-                        println!("Sync done");
+                        debug!("Sync done");
                         return Ok(());
                     }
                     ClientStateEnum::Invalid => {
@@ -1473,11 +1752,9 @@ mod client {
 }
 
 mod file_set {
+    use std::borrow::Borrow;
     use crate::file_set::Entry::File;
-    use crate::{
-        CHECKSUM_SIZE, IndexInPhase, PacketIdx, PhaseOffset, PhaseSize, byte_range,
-        calculate_phase_offset, overlaps,
-    };
+    use crate::{byte_range, calculate_phase_offset, overlaps, IndexInPhase, PacketIdx, PhaseOffset, PhaseSize, CHECKSUM_SIZE, CHECKSUM_SIZE_U64};
     use anyhow::{Error, Result, anyhow, bail};
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
     use rayon::prelude::IntoParallelIterator;
@@ -1487,15 +1764,77 @@ mod file_set {
     use std::ops::{Range, RangeInclusive};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use compio::bytes::{BufMut, Bytes, BytesMut};
     use savefile::prelude::Savefile;
     use savefile::Serializer;
+    use tracing::{debug, error, info, trace};
 
-    #[derive(Savefile,Debug)]
-    enum Kind {
+    #[derive(Savefile,Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
         Normal,
         Symlink,
+        /// Only used for the fileset itself
+        FileSet,
     }
+
+    const CHECKSUM_U32_WORDS: usize = CHECKSUM_SIZE/4;
+    #[derive(Debug)]
+    pub struct AtomicChecksum {
+        data: [AtomicU32; CHECKSUM_U32_WORDS],
+    }
+
+    impl Clone for AtomicChecksum {
+        fn clone(&self) -> Self {
+            Self {
+                data: [
+                    AtomicU32::new(self.data[0].load(Ordering::Relaxed)),
+                    AtomicU32::new(self.data[1].load(Ordering::Relaxed)),
+                    AtomicU32::new(self.data[2].load(Ordering::Relaxed)),
+                    AtomicU32::new(self.data[3].load(Ordering::Relaxed)),
+                ]
+            }
+        }
+    }
+    impl Default for AtomicChecksum {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl AtomicChecksum {
+        pub fn new() -> Self {
+            Self {
+                data: [
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                ]
+            }
+        }
+        pub fn update(&self, checksum: [u8; CHECKSUM_SIZE]) {
+            for i in (0..CHECKSUM_U32_WORDS) {
+                self.data[i].store(u32::from_le_bytes(checksum[4*i..4*(i+1)].try_into().unwrap()), Ordering::Relaxed);
+            }
+        }
+        pub fn partial_update(&self, offset: usize, byts: &[u8]) {
+            assert!(offset+ byts.len() <= CHECKSUM_SIZE);
+            let mut temp = self.bytes();
+            temp[offset..offset+byts.len()].copy_from_slice(byts);
+            self.update(temp);
+        }
+
+        pub fn bytes(&self) -> [u8; CHECKSUM_SIZE] {
+            let mut buf = [0u8; CHECKSUM_SIZE];
+            for i in (0..CHECKSUM_U32_WORDS) {
+                buf[4*i..4*(i+1)].copy_from_slice(&self.data[i].load(Ordering::Relaxed).to_le_bytes());
+            }
+            buf
+        }
+    }
+
+
+
 
     #[derive(Savefile,Debug)]
     struct RFile {
@@ -1505,6 +1844,12 @@ mod file_set {
         mode_bits: u32,
         offset: PhaseOffset,
         kind: Kind,
+        #[savefile_ignore]
+        #[savefile_introspect_ignore]
+        has_checksum: AtomicBool,
+        #[savefile_ignore]
+        #[savefile_introspect_ignore]
+        checksum: AtomicChecksum
     }
 
     impl Add<u64> for PhaseOffset {
@@ -1528,10 +1873,27 @@ mod file_set {
         files: Vec<Entry>,
     }
 
+    impl RDirectory {
+        pub(crate) fn entry_for(&self, packet_offset: PhaseOffset) -> Option<&Entry> {
+            let mut idx = match self.files
+                .binary_search_by_key(&packet_offset, |entry| entry.first_offset())
+            {
+                Ok(found_index) => found_index,
+                Err(found_index) => found_index - 1,
+            };
+            while idx < self.files.len() &&
+                self.files[idx].last_offset_exclusive()<= packet_offset {
+                idx += 1;
+            }
+            self.files.get(idx)
+        }
+    }
+
     #[derive(Savefile,Debug)]
     enum Entry {
         File(RFile),
         Directory(RDirectory),
+        FileSet(Option<Arc<[u8]>>)
     }
 
     impl Entry {
@@ -1541,6 +1903,7 @@ mod file_set {
                 Entry::Directory(d) => {
                     d.files.iter().map(|x|x.file_count()).sum()
                 }
+                Entry::FileSet(_) => {0}
             }
         }
         pub(crate) fn file_size(&self) -> u64 {
@@ -1549,6 +1912,7 @@ mod file_set {
                 Entry::Directory(d) => {
                     d.files.iter().map(|x|x.file_size()).sum()
                 }
+                Entry::FileSet(s) => {0}
             }
         }
 
@@ -1556,8 +1920,17 @@ mod file_set {
             match self {
                 File(f) => &f.name,
                 Entry::Directory(d) => &d.name,
+                Entry::FileSet(_) => {Path::new("?fileset?")}
             }
         }
+    }
+
+
+    #[derive(Savefile, Debug)]
+    pub struct FileSetPhaseEntry {
+        #[savefile_ignore]
+        path: PathBuf,
+        entry: Entry,
     }
 
     #[derive(Savefile, Debug)]
@@ -1565,11 +1938,23 @@ mod file_set {
         /// Base and entry
         ///
         /// This does not include the fileset phase (phase 0)
-        phases: Vec<(PathBuf, Entry)>,
+        phases: Vec<FileSetPhaseEntry>,
+    }
+
+    impl FileSet {
+        pub(crate) fn replace_phase_paths(&mut self, paths: &Vec<PathBuf>) -> Result<()> {
+            if paths.len() +1  != self.phases.len() {
+                bail!("Wrong number of input paths. The number of input paths must be {}, not {}", self.phases.len().saturating_sub(1), paths.len());
+            }
+            for (path, new_path) in self.phases.iter_mut().skip(1).zip(paths.iter()) {
+                path.path = new_path.clone();
+            }
+            Ok(())
+        }
     }
 
     pub struct Meta {
-        pub fileset_buf: Bytes,
+        pub fileset_buf: Arc<[u8]>,
         /// This is the number of phases excluding the FileSet phase
         pub phases: u16,
         pub file_count: u64,
@@ -1601,10 +1986,12 @@ mod file_set {
         pub file_offset: u64,
         // Size *including* checksum
         pub file_size: u64,
+        pub checksum: &'a AtomicChecksum,
+        pub file_range: Range<PhaseOffset>,
     }
 
     impl<'a> FileSetCursor<'a> {
-        pub fn cur_range(&self) -> Range<PhaseOffset> {
+        fn cur_range(&self) -> Range<PhaseOffset> {
             if self.set.num_phases() == 0 {
                 return (PhaseOffset::ZERO..PhaseOffset::ZERO).into();
             };
@@ -1612,8 +1999,8 @@ mod file_set {
             if let Some(top) = self.stack.last() {
                 (top.first_offset()..top.last_offset_exclusive()).into()
             } else {
-                (self.set.phases.first().unwrap().1.first_offset()
-                    ..self.set.phases.last().unwrap().1.last_offset_exclusive())
+                (self.set.phases.first().unwrap().entry.first_offset()
+                    ..self.set.phases.last().unwrap().entry.last_offset_exclusive())
                     .into()
             }
         }
@@ -1621,23 +2008,28 @@ mod file_set {
             if packet_phase as usize >= self.set.num_phases() {
                 bail!("Bad phase");
             }
+            if packet_phase == 0 {
+                bail!("FileSetCursor is not intended for use with phase 0");
+            }
 
             loop {
                 if self.cur_phase != packet_phase {
                     self.path.clear();
                     self.stack.clear();
+                    self.cur_phase = packet_phase;
                 }
                 if !self.stack.is_empty() && !self.cur_range().contains(&packet_offset) {
+                    //debug!("Backing up, cur range is {} , {:?} which doesn't encompass packet {:?}", self.path.display(), self.cur_range(), packet_offset);
                     self.stack.pop();
                     self.path.pop();
                     continue;
                 }
 
                 if self.stack.is_empty() {
-                    let (phase_path, phase_entry) = &self.set.phases[packet_phase as usize];
-                    self.path = phase_path.clone();
-                    self.path.push(phase_entry.name());
-                    self.stack.push(phase_entry);
+                    let FileSetPhaseEntry{ path, entry } = &self.set.phases[packet_phase as usize];
+                    self.path = path.clone();
+                    self.path.push(entry.name());
+                    self.stack.push(entry);
                 }
 
                 let top = self.stack.last().unwrap();
@@ -1649,20 +2041,20 @@ mod file_set {
                             path: &self.path,
                             file_offset,
                             file_size: f.size,
+                            checksum: &f.checksum,
+                            file_range: f.offset .. f.offset + f.size,
                         });
                     }
                     Entry::Directory(d) => {
-                        let file_index = match d
-                            .files
-                            .binary_search_by_key(&packet_offset, |entry| entry.first_offset())
-                        {
-                            Ok(found_index) => found_index,
-                            Err(found_index) => found_index.saturating_sub(1),
-                        };
-                        let entry = &d.files[file_index];
-                        println!("Pushing name {:?}", d.name);
+                        let entry = d.entry_for(packet_offset).expect("we know entry contains range");
+                        debug!("Pushing name {:?}, seek: {}.{:?}, parent start: {:?} sub item range: {:?}", entry.name(), packet_phase, packet_offset,
+                                d.offset,
+                                 entry.first_offset()..entry.last_offset_exclusive());
                         self.path.push(entry.name());
                         self.stack.push(entry);
+                    }
+                    Entry::FileSet(_) => {
+                        unreachable!("fileset is only in phase 0")
                     }
                 }
             }
@@ -1674,7 +2066,7 @@ mod file_set {
         fn max_index_eclusive(&self, phase: u16) -> Option<PhaseOffset> {
             Some(PhaseOffset(
                 self.phases[phase as usize]
-                    .1
+                    .entry
                     .last_offset_exclusive()
                     .0
                     .div_ceil(crate::PAYLOAD_SIZE),
@@ -1684,12 +2076,10 @@ mod file_set {
 
     impl FileSet {
 
-        /// Phase 0 will be empty, since it's the fileset phase
-        pub(crate) fn get_phases(&self) -> Vec<(u16, PhaseOffset)> {
+        /// Phase 0 is exlcuded
+        pub(crate) fn get_phases_excluding_first_phase(&self) -> Vec<(u16, PhaseOffset)> {
             let mut output = vec![];
-            output.push((0, PhaseOffset(0)));
-
-            for (i,(_path, entry)) in self.phases.iter().enumerate() {
+            for (i,FileSetPhaseEntry{entry,..}) in self.phases.iter().enumerate().skip(1) {
                 output.push((i as u16, entry.last_offset_exclusive()))
             }
             output
@@ -1709,33 +2099,48 @@ mod file_set {
             self.phases.len()
         }
 
-        pub fn meta(&self) -> Result<Meta> {
+        pub fn calculate_meta_and_assign_fileset_buf(&mut self) -> Result<Meta> {
             let mut fileset_buf = BytesMut::new();
 
             Serializer::bare_serialize(&mut (&mut fileset_buf).writer(), 0, self)?;
 
+            let fileset_buf: Arc<[u8]> = fileset_buf.to_vec().into();
+
+            let phase0 = &mut self.phases.get_mut(0).expect("phase 0 should always have been allocated").entry;
+            match phase0 {
+                File(_) => {}
+                Entry::Directory(_) => {}
+                Entry::FileSet(fs) => {
+                    assert!(fs.is_none());
+                    *fs = Some(fileset_buf.clone());
+
+                }
+            }
+
             Ok(Meta {
-                fileset_buf: fileset_buf.freeze(),
+                fileset_buf,
                 phases: self.phases.len() as u16,
-                file_count: self.phases.iter().map(|x|x.1.file_count()).sum(),
-                total_size_bytes: self.phases.iter().map(|x|x.1.file_size()).sum(),
+                file_count: self.phases.iter().map(|x|x.entry.file_count()).sum(),
+                total_size_bytes: self.phases.iter().map(|x|x.entry.file_size()).sum(),
             })
         }
 
         /// Always visits in PhaseOffset-order, guaranteed
-        pub fn visit(
+        pub fn visit<'a>(
             &self,
             range: Range<PacketIdx>,
-            f: &mut impl FnMut(u16, Range<PhaseOffset>, &Path, u64, u64),
+            f: &mut impl FnMut(u16, Range<PhaseOffset>, Source, u64, u64, Kind)
         ) -> Result<()> {
+
             for (phase, range) in PacketIdx::phases(range, self) {
+                trace!("Fetch sub-range {}.{:?}", phase, range);
                 let byte_range = range;
-                let mut cwd = self.phases[phase as usize].0.clone();
-                self.phases[phase as usize].1.visit(
+                let mut cwd = self.phases[phase as usize].path.clone();
+                self.phases[phase as usize].entry.visit(
                     &mut cwd,
                     byte_range,
-                    &mut |phase_offset, path, offset, file_size| {
-                        f(phase, phase_offset, path, offset, file_size)
+                    &mut |phase_offset, source, offset, file_size, is_link| {
+                        f(phase, phase_offset, source, offset, file_size, is_link)
                     },
                 )?;
             }
@@ -1743,12 +2148,32 @@ mod file_set {
         }
 
         pub fn new(items: Vec<impl AsRef<Path>>) -> Result<FileSet> {
-            let items: Vec<PathBuf> = items.iter().map(|x| x.as_ref().into()).collect();
+
+            let mut items: Vec<PathBuf> = items.iter().map(|x| x.as_ref().into()).collect();
+            info!("fileset created from paths: {:#?}", items);
+
+
+            let mut phases = vec![
+                FileSetPhaseEntry {
+                    //TODO: get rid of ugly place-holder value
+                    path: "?fileset?".into(),
+                    entry: Entry::FileSet(None),
+                }
+            ];
+
+            let mut non_fileset_phases : Vec<_> = items
+                .par_iter()
+                .map(|x| Ok(
+                    FileSetPhaseEntry {
+                        path: x.clone(),
+                        entry:Entry::new(x)?
+                    }
+                )).collect::<Result<_>>()?
+            ;
+
+            phases.extend(non_fileset_phases);
             Ok(FileSet {
-                phases: items
-                    .par_iter()
-                    .map(|x| Ok((x.clone(), Entry::new(x)?)))
-                    .collect::<Result<_>>()?,
+                phases
             }
             .assign_offsets())
         }
@@ -1759,7 +2184,7 @@ mod file_set {
                     .phases
                     .into_iter()
                     .map(|mut x| {
-                        x.1.assign_offsets(&mut PhaseOffset(0));
+                        x.entry.assign_offsets(&mut PhaseOffset(0));
                         x
                     })
                     .collect(),
@@ -1775,41 +2200,104 @@ mod file_set {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub enum OwnedSourceId {
+        Path(PathBuf),
+        FileSet,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub enum OwnedSource {
+        Path(PathBuf),
+        FileSet(Arc<[u8]>),
+    }
+
+    #[derive(Clone, Debug)]
+    pub enum Source<'a> {
+        Path(&'a Path),
+        FileSet(&'a Arc<[u8]>)
+    }
+
+    impl OwnedSource {
+        pub fn to_owned_id(&self) -> OwnedSourceId {
+            match self {
+                OwnedSource::Path(p) => {OwnedSourceId::Path(p.to_path_buf())}
+                OwnedSource::FileSet(_) => {OwnedSourceId::FileSet}
+            }
+        }
+    }
+    impl<'a> Source<'a> {
+
+        pub fn to_owned(&self) -> OwnedSource {
+            match self {
+                Source::Path(p) => {OwnedSource::Path(p.to_path_buf())}
+                Source::FileSet(a) => {OwnedSource::FileSet(Arc::clone(a))}
+            }
+        }
+    }
+
     impl Entry {
         fn visit(
             &self,
             cwd: &mut PathBuf,
             range: Range<PhaseOffset>,
-            func: &mut impl FnMut(Range<PhaseOffset>, &Path, u64, u64),
+            func: &mut impl FnMut(Range<PhaseOffset>, Source, u64, u64, Kind),
         ) -> Result<()> {
+            if range.start >= self.last_offset_exclusive() {
+                bail!("Range {range:?} not present in Entry");
+            }
             match self {
                 Entry::File(f) => {
                     if let Some(overlap) = overlaps(f.range(), range.clone()) {
                         cwd.push(&f.name);
-                        func(overlap.clone(), &cwd, overlap.start - f.offset, f.size);
+                        func(overlap.clone(), Source::Path(&cwd), overlap.start - f.offset, f.size, f.kind);
                         cwd.pop();
+                    } else {
+                        trace!("Ignoring file {} because it doesn't overlap range", f.name.display());
                     }
                     Ok(())
                 }
                 Entry::Directory(d) => {
+                    if d.files.is_empty() {
+                        // Can't be any bytes in here to visit
+                        trace!("Ignoring directory {} because it's empty", d.name.display());
+                        return Ok(());
+                    }
                     let mut cur = match d
                         .files
-                        .binary_search_by_key(&range.start, |y| y.first_offset())
+                        .binary_search_by_key(&range.start, |entry| entry.first_offset())
                     {
                         Ok(x) => x,
-                        Err(x) => x.saturating_sub(1),
+                        Err(x) => {
+                            x.saturating_sub(1)
+                        },
                     };
                     cwd.push(&d.name);
+                    trace!("recursing into dir {}", d.name.display());
                     while cur < d.files.len() {
                         if d.files[cur].first_offset() >= range.end {
                             // Done
                             break;
                         }
-                        d.files[cur].visit(cwd, range.clone(), func)?;
+                        if d.files[cur].last_offset_exclusive() > range.start {
+                            d.files[cur].visit(cwd, range.clone(), func)?;
+                        } else {
+                            trace!("Ignoring file {:?}.{cur} because it doesn't overlap range", d.name.display());
+                        }
                         cur += 1;
                     }
                     cwd.pop();
                     Ok(())
+                }
+                Entry::FileSet(Some(buf)) => {
+                    if let Some(overlap) = overlaps(PhaseOffset(0)..PhaseOffset(buf.len() as u64), range.clone()) {
+                        let offset = PhaseOffset(0);
+                        let size = buf.len() as u64;
+                        func(overlap.clone(), Source::FileSet(buf), overlap.start - offset, size + CHECKSUM_SIZE_U64, Kind::FileSet);
+                    }
+                    Ok(())
+                }
+                Entry::FileSet(None) => {
+                    bail!("visited FileSet entry before it had been populated")
                 }
             }
         }
@@ -1817,6 +2305,7 @@ mod file_set {
             match self {
                 Entry::File(f) => f.offset,
                 Entry::Directory(d) => d.offset,
+                Entry::FileSet(_) => {PhaseOffset(0)}
             }
         }
         fn last_offset_exclusive(&self) -> PhaseOffset {
@@ -1829,6 +2318,8 @@ mod file_set {
                         d.offset
                     }
                 }
+                Entry::FileSet(Some(d)) => {PhaseOffset(d.len() as u64 + CHECKSUM_SIZE_U64)}
+                Entry::FileSet(_) => panic!("last_offset_exclusive called before FileSet added to structure")
             }
         }
         fn assign_offsets(&mut self, accum_offset: &mut PhaseOffset) {
@@ -1836,13 +2327,14 @@ mod file_set {
                 Entry::File(f) => {
                     f.offset = *accum_offset;
                     accum_offset.0 += f.size;
-                    accum_offset.0 += CHECKSUM_SIZE as u64;
                 }
                 Entry::Directory(d) => {
                     d.offset = *accum_offset;
                     for item in &mut d.files {
                         item.assign_offsets(accum_offset);
                     }
+                }
+                Entry::FileSet(_) => {
                 }
             }
         }
@@ -1885,7 +2377,7 @@ mod file_set {
                             } else if typ.is_dir() {
                                 return Some(Entry::scan(&entry.path(), entry.file_name().into()));
                             } else {
-                                eprintln!("{:?} is not a file or symlink", entry.path());
+                                error!("{:?} is not a file or symlink", entry.path());
                                 return None;
                             }
                         },
@@ -1906,6 +2398,8 @@ mod file_set {
                 } else {
                     Kind::Normal
                 },
+                has_checksum: Default::default(),
+                checksum: Default::default(),
             }))
         }
     }
@@ -1915,45 +2409,46 @@ mod file_set {
     #[cfg(test)]
     mod tests {
         use crate::disk_read_engine::ReadEngine;
-        use crate::file_set::{Entry, FileSet};
+        use crate::file_set::{AtomicChecksum, Entry, FileSet};
         use crate::{IndexInPhase, PacketIdx, PhaseOffset, RetransmitGeneration, SessionId};
         use std::fs::read_dir;
 
         #[test]
         fn scan_home() {
             let files = Entry::new("/home/anders").unwrap();
-            println!("Done");
-            //println!("Files: {:?}", files);
+            debug!("Done");
+            //debug!("Files: {:?}", files);
         }
         #[test]
         fn scan_home2() {
             let files = FileSet::new(vec!["/home/anders/sample"]).unwrap();
 
+
             files
                 .visit(
                     (PacketIdx::new(0, PhaseOffset::ZERO)..PacketIdx::new(0, PhaseOffset(1000)))
                         .into(),
-                    &mut |phase, idx, path, offset_in_file, file_size| {
-                        println!(
+                    &mut |phase, idx, path, offset_in_file, file_size, link| {
+                        debug!(
                             "Visit: {} / {:?} {:?} offset {}",
                             phase, idx, path, offset_in_file
                         );
                     },
                 )
                 .unwrap();
-            println!("Done");
-            //println!("Files: {:#?}", files);
+            debug!("Done");
+            //debug!("Files: {:#?}", files);
 
             let mut cursor = files.make_cursor();
 
             let need = cursor.seek(0, PhaseOffset(1000)).unwrap();
-            println!("Cursor result: {:?}", need);
+            debug!("Cursor result: {:?}", need);
             let need = cursor.seek(0, PhaseOffset(4000)).unwrap();
-            println!("Cursor result: {:?}", need);
+            debug!("Cursor result: {:?}", need);
             let need = cursor.seek(0, PhaseOffset(4001)).unwrap();
-            println!("Cursor result: {:?}", need);
+            debug!("Cursor result: {:?}", need);
             let need = cursor.seek(0, PhaseOffset(000)).unwrap();
-            println!("Cursor result: {:?}", need);
+            debug!("Cursor result: {:?}", need);
         }
 
         #[compio::test]
@@ -1967,13 +2462,26 @@ mod file_set {
                     SessionId(0),
                     (PacketIdx::new(0, PhaseOffset(0))..PacketIdx::new(0, PhaseOffset(2))).into(),
                     async |pkt| {
-                        println!("Sending: {:?}", pkt);
+                        debug!("Sending: {:?}", pkt);
                     },
                 )
                 .await;
 
-            println!("Pkt: {:?}", pkt);
+            debug!("Pkt: {:?}", pkt);
         }
+
+        #[test]
+        fn atomic_checksum() {
+            let mut sum = AtomicChecksum::new();
+            sum.update([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);
+            assert_eq!(sum.bytes(), [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);
+
+            sum.partial_update(15, &[1]);
+            assert_eq!(sum.bytes(), [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,1]);
+            sum.partial_update(11, &[1,2]);
+            assert_eq!(sum.bytes(), [1,2,3,4,5,6,7,8,9,10,11,1,2,14,15,1]);
+        }
+
     }
 }
 
@@ -1981,6 +2489,9 @@ mod util {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use compio::net::UdpSocket;
     use socket2::{Domain, Protocol, Socket, Type};
+    use tracing::info;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
 
     pub fn fast_hash(bytes: &[u8]) -> u64 {
         const K: u64 = 0x517c_c1b7_2722_0a95; // odd, well-mixed constant
@@ -2007,6 +2518,24 @@ mod util {
         hash = hash.wrapping_mul(K);
         hash ^= hash >> 32;
         hash
+    }
+
+    pub fn unicast_socket(
+        iface: Ipv4Addr,
+    ) -> std::io::Result<UdpSocket> {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+
+        // Bind to the port. Binding to INADDR_ANY (or the group addr) + reuse
+        // lets several sockets share it.
+        let bind_addr: SocketAddr = SocketAddrV4::new(iface, 0).into();
+        sock.bind(&bind_addr.into())?;
+
+        // Convert socket2 -> std -> compio.
+        let std_sock: std::net::UdpSocket = sock.into();
+
+        std_sock.set_nonblocking(true)?; // harmless; keeps semantics consistent
+        Ok(UdpSocket::from_std(std_sock)?)
     }
 
     pub fn reusable_multicast_socket(
@@ -2037,10 +2566,86 @@ mod util {
         Ok(UdpSocket::from_std(std_sock)?)
     }
 
+    pub fn setup_tracing() {
+
+        if std::env::var("RUST_LOG_JSON").is_ok() {
+            let stdout_log = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .json()
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+
+            let subscriber = tracing_subscriber::registry().with(stdout_log);
+            _ = tracing::subscriber::set_global_default(subscriber);
+        } else {
+            let stdout_log = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+
+            let subscriber = tracing_subscriber::registry().with(stdout_log);
+            _ = tracing::subscriber::set_global_default(subscriber);
+        }
+        info!("Tracing enabled");
+    }
+
+
+
 }
 
-fn main() {
-    println!("Hello, world!");
+
+use clap::Parser;
+
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Interface to use
+    #[arg(short, long)]
+    iface: Ipv4Addr,
+
+    /// Paths to send
+    #[arg(short, long)]
+    send: Vec<PathBuf>,
+
+    /// Path to receive to
+    #[arg(short, long)]
+    recv: Vec<PathBuf>,
+
+    /// Allow local operation
+    #[arg(short, long, default_value = "true")]
+    //TODO: Actually use
+    local: bool,
+}
+
+#[compio::main]
+async fn main() -> anyhow::Result<()> {
+    setup_tracing();
+    let args = Args::parse();
+
+    if !args.send.is_empty() && !args.recv.is_empty() {
+        bail!("Can't both send and receive files")
+    }
+
+    if args.send.is_empty() && args.recv.is_empty() {
+        bail!("Must give at least one --send or --recv argument");
+    }
+
+    if !args.send.is_empty() {
+        ServerState::run(ServerConfig {
+            local_iface: args.iface,
+            phases: args.send,
+            ..ServerConfig::default()
+        }).await?;
+        Ok(())
+    } else {
+        let mut client = client::ClientState::new(ClientConfig {
+            bind_address: args.iface,
+            paths: args.recv,
+            ..ClientConfig::default()
+        }).await?;
+        client.run().await?;
+        Ok(())
+    }
+
 }
 
 
@@ -2049,12 +2654,16 @@ mod tests {
     use crate::client;
     use crate::client::ClientConfig;
     use crate::server::ServerConfig;
+    use crate::util::setup_tracing;
 
     #[compio::test]
     async fn start_client() {
+        setup_tracing();
         spawn(async move {
             let mut client = client::ClientState::new(ClientConfig::default()).await.unwrap();
             client.run().await.unwrap();
+
+            std::process::exit(0);
         }).detach();
 
 

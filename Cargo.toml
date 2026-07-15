@@ -3,6 +3,12 @@ name = "rfilecopy"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
 [dependencies]
 compio= { version = "0.19.1", features = ["runtime", "net", "fs", "time", "macros", "bytes"] }
 savefile= { version = "0.21.0", path = "../savefile/savefile", features = ["bytes"] }
@@ -14,7 +20,10 @@ flume = "0.12.0"
 indexmap = "2.14.0"
 rangemap = "1.7.1"
 smallvec = "1.15.2"
-blake3 = "1.8.5"
+blake3 = { version = "1.8.5", features = ["rayon", "mmap"] }
 rand = "0.10.2"
 futures-util ="0.3.32"
 socket2 = "0.6.5"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+tracing = "0.1.44"
+clap = { version= "4.6.1", features = ["derive"] }
