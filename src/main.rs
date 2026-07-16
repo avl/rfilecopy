@@ -69,6 +69,18 @@ impl RetransmitGeneration {
 #[derive(Savefile, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PacketIdx(u64);
 
+impl PacketIdx {
+
+    // TODO: Fail construction of invalid values through other means
+    pub const INVALID: PacketIdx = PacketIdx(u64::MAX);
+
+    pub(crate) fn saturating_sub(&self, index: IndexInPhase) -> PacketIdx {
+        let new_index = self.index().0.saturating_sub(index.0);
+
+        PacketIdx::new(self.phase(), IndexInPhase(new_index))
+    }
+}
+
 impl Debug for PacketIdx {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "#{}.{}",
@@ -102,7 +114,7 @@ impl IndexInPhase {
 }
 
 trait PhaseSize {
-    fn max_index_eclusive(&self, phase: u16) -> Option<PhaseOffset>;
+    fn max_offset_exclusive(&self, phase: u16) -> Option<PhaseOffset>;
 }
 
 pub fn overlaps<T: Ord>(a: Range<T>, b: Range<T>) -> Option<Range<T>> {
@@ -173,7 +185,7 @@ impl PacketIdx {
             })..(if phases.end.phase() == phase {
                 calculate_phase_offset(phases.end.index())
             } else {
-                phase_size.max_index_eclusive(phase)?
+                phase_size.max_offset_exclusive(phase)?
             }))
                 .into();
             if range.start == range.end {
@@ -196,7 +208,7 @@ mod messages {
     const MAX_SECTIONS_PER_REQUEST: usize = 5;
     const MAX_SECTIONS_PER_PAYLOAD: usize = 5;
 
-    #[derive(Savefile, PartialEq, Debug)]
+    #[derive(Savefile, PartialEq, Debug, Clone)]
     pub enum LinkQualitySignal {
         KeepGoing,
         IncreaseWindow,
@@ -220,7 +232,10 @@ mod messages {
         pub index: PacketIdx,
         /// We're approaching the end of the batch, clients
         /// are encouraged to make new requests (with retransmit_generation + 1)
-        pub eof_approaching: bool,
+        ///
+        /// The new request should start at the given packedidx, to avoid retransmitting
+        /// already queued stuff.
+        pub eof_approaching: PacketIdx,
         pub data: Bytes,
     }
 
@@ -228,7 +243,7 @@ mod messages {
         /// Size of a 0-payload `Message::Payload` message.
         ///
         /// Includes Message tag and payload size field.
-        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 2 + 8 + 1 + 8;
+        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 2 + 8 + 1 + 8 + 8;
     }
 
     #[derive(Savefile, PartialEq, Debug)]
@@ -377,7 +392,7 @@ mod messages {
                 session_id: SessionId(42),
                 retransmit_generation: RetransmitGeneration(37),
                 index: PacketIdx::new(42, PhaseOffset::ZERO),
-                eof_approaching: false,
+                eof_approaching: None,
                 data: b"hello"[..].into(),
             }));
             roundtrip(Message::Announce(Announce {
@@ -396,7 +411,7 @@ mod disk_read_engine {
     use crate::file_set::{FileSet, Kind, OwnedSource, OwnedSourceId, Source};
     use crate::messages::Payload;
     use crate::{calculate_phase_offset, messages, IndexInPhase, PacketIdx, PhaseOffset, PhaseSize, RetransmitGeneration, SessionId, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE, PAYLOAD_SIZE_USIZE_WITHOUT_HASH, PRE_REQUEST_TIME};
-    use anyhow::{Result, bail};
+    use anyhow::{anyhow, bail, Result, Context};
     use compio::BufResult;
     use compio::buf::{IoBuf, IoBufMut, SetLen};
     use compio::bytes::{Bytes, BytesMut};
@@ -471,8 +486,8 @@ mod disk_read_engine {
 
     #[derive(Debug)]
     pub enum ChecksummingState {
-        Hashing { hasher: blake3::Hasher, offset: u64 },
-        Finished([u8; CHECKSUM_SIZE]),
+        Hashing { hasher: blake3::Hasher, offset: u64, hashed_bytes: Vec<u8> },
+        Finished([u8; CHECKSUM_SIZE], Vec<u8>),
     }
 
     impl Default for ChecksummingState {
@@ -480,6 +495,7 @@ mod disk_read_engine {
             Self::Hashing {
                 hasher: Default::default(),
                 offset: 0,
+                hashed_bytes: vec![],
             }
         }
     }
@@ -629,20 +645,30 @@ mod disk_read_engine {
 
             let mut buf = BytesMut::new();
 
-            let mut output_idx = idx;
+            let mut output_idx = idx.clone();
 
             let task_len = tasks.len();
             for (task_i, (phase, phase_offset, source, offset, nominal_file_size, kind)) in
                 tasks.into_iter().enumerate()
             {
-                trace!("fetch task: {task_i}, offset = {offset}, nominal_file_size = {nominal_file_size}, kind = {kind:?}");
+                trace!("fetch task: {task_i}, offset = {offset}, nominal_file_size = {nominal_file_size}, kind = {kind:?}, phaserange {:?}", phase_offset);
                 let real_file_size = nominal_file_size - CHECKSUM_SIZE_U64;
-                let chunk_size = (phase_offset.end - phase_offset.start).min(real_file_size - offset);
+
+                // Size including any checksum (fragment)
+                let full_chunk_size = (phase_offset.end - phase_offset.start);
+
+                let chunk_size = if offset < real_file_size {
+                    full_chunk_size.min(real_file_size - offset)
+                }  else {
+                    0
+                };
+
+                    //(phase_offset.end - phase_offset.start).min(real_file_size - offset);
                 assert!(chunk_size + offset <= real_file_size + 16,
                     "chunk_size = {}, offset = {}, this is greater than real file size {} + 16",
                     chunk_size, offset, real_file_size
                 );
-                buf.reserve(chunk_size as usize + CHECKSUM_SIZE);
+                buf.reserve(chunk_size as usize);
                 let buflen = buf.len();
 
                 match (kind, &source) {
@@ -687,44 +713,77 @@ mod disk_read_engine {
                     None => self.checksums.entry(source.to_owned_id()).or_default(),
                 };
 
+                // bytes read just now
+                let cur_read_bytes = &buf[buflen..];
+                assert_eq!(cur_read_bytes.len(), chunk_size as usize);
+
                 match cksumstate {
                     ChecksummingState::Hashing {
                         hasher,
-                        offset: hashed_offset,
+                        offset: already_hashed_offset,
+                        hashed_bytes
                     } => {
-                        if offset + chunk_size > *hashed_offset && *hashed_offset >= offset
+
+                        if offset + chunk_size > *already_hashed_offset && offset <= *already_hashed_offset
                         {
-                            let new_part_start_at = *hashed_offset - offset;
-                            let new_part_size = (offset + chunk_size) - *hashed_offset;
+                            if hashed_bytes.len() < (offset + chunk_size) as usize {
+                                hashed_bytes.resize((offset + chunk_size) as usize, 0);
+                                hashed_bytes[offset as usize..offset as usize+chunk_size as usize].copy_from_slice(&cur_read_bytes);
+                            }
+
+                            let new_part_start_at = *already_hashed_offset - offset;
+                            let new_part_size = (offset + chunk_size) - *already_hashed_offset;
+                            let upd_part = &cur_read_bytes[new_part_start_at as usize
+                                ..(new_part_start_at + new_part_size) as usize];
+                            //println!("Hashing with update-part: {}", String::from_utf8_lossy(upd_part));
                             hasher.update(
-                                &buf[new_part_start_at as usize
-                                    ..(new_part_start_at + new_part_size) as usize],
+                                upd_part,
                             );
+                            *already_hashed_offset = offset + chunk_size;
                             if offset + chunk_size == real_file_size {
                                 let hash: [u8; CHECKSUM_SIZE] =
                                     hasher.finalize().as_bytes()[0..16].try_into().unwrap();
-                                *cksumstate = ChecksummingState::Finished(hash);
+                                *cksumstate = ChecksummingState::Finished(hash, hashed_bytes.clone());
                             }
                         }
                     }
-                    ChecksummingState::Finished(_) => {}
+                    ChecksummingState::Finished(_,_) => {}
                 }
-                if offset + chunk_size == real_file_size {
-                    buf.reserve(CHECKSUM_SIZE);
+
+                assert!(offset + chunk_size <= real_file_size);
+                assert!(offset + full_chunk_size <= real_file_size + CHECKSUM_SIZE_U64);
+
+                if offset + full_chunk_size > real_file_size {
+                    let checksum_read_start = offset.saturating_sub(real_file_size);
+                    let checksum_read_end = offset + full_chunk_size - real_file_size;
+                    let checksum_read = checksum_read_end - checksum_read_start;
+                    trace!("copying checksum {:?}", checksum_read_start .. checksum_read_end);
+
+                    buf.reserve(checksum_read as usize);
                     let source = source.to_owned();
                     buf.extend_from_slice(
-                        &self.get_checksum(&source, real_file_size).await?,
+                        &self.get_checksum(&source, real_file_size).await?[checksum_read_start as usize..checksum_read_end as usize],
                     );
                 }
-                if task_i + 1 == task_len || buf.len() >= PAYLOAD_SIZE_USIZE {
+
+                assert_eq!(
+                    buf.len() - buflen,
+                    full_chunk_size as usize
+                )
+                ;
+                while !buf.is_empty() && ( task_i + 1 == task_len || buf.len() >= PAYLOAD_SIZE_USIZE ) {
                     let pktbuf =
                         buf.split_to(PAYLOAD_SIZE_USIZE.min(buf.len())).freeze();
                     trace!("server emitting payload: {} bytes", pktbuf.len());
+                    let eof_approaching = ( output_idx.start == idx.end.saturating_sub(IndexInPhase(PRE_REQUEST_TIME as u64))).then_some(
+                        idx.end
+                    );
+                    println!("Sending {:?} eof {}", output_idx.start, eof_approaching.is_some());
                     tx(Payload {
-                        session_id: session_id,
+                        session_id,
                         retransmit_generation: logical_time,
                         index: output_idx.start,
-                        eof_approaching: task_i + PRE_REQUEST_TIME > task_len,
+                        eof_approaching: eof_approaching.unwrap_or(PacketIdx::INVALID),
                         data: pktbuf,
                     })
                     .await;
@@ -748,7 +807,7 @@ mod disk_read_engine {
         fn successor(&self, index: PacketIdx) -> PacketIdx {
             let phase = index.phase();
             let phase_offset = calculate_phase_offset(index.index());
-            if let Some(max_index_of_phase) = self.files.max_index_eclusive(phase)
+            if let Some(max_index_of_phase) = self.files.max_offset_exclusive(phase)
                 && phase_offset >= max_index_of_phase
                 && phase as usize != self.files.num_phases()
             {
@@ -767,35 +826,57 @@ mod disk_read_engine {
                 cksum = Some(self.checksums.entry(source.to_owned_id()).or_default());
             }
             match cksum.as_mut().unwrap() {
-                ChecksummingState::Hashing { hasher, offset } => {
+                ChecksummingState::Hashing { hasher, offset, hashed_bytes } => {
 
                     match source {
                         OwnedSource::Path(path) => {
-                            let f = File::open(path).await?;
 
-                            let mut vec = vec![0; READ_ENGINE_BUF_SIZE];
-                            while *offset < real_file_size {
-                                let to_read = (real_file_size - *offset).min(READ_ENGINE_BUF_SIZE as u64);
-                                vec.resize(to_read as usize, 0);
-                                vec = match f.read_exact_at(vec, *offset).await.into_parts() {
-                                    (Ok(_), buf) => {
-                                        hasher.update(&buf);
-                                        *offset += buf.len() as u64;
-                                        buf
-                                    }
-                                    (Err(err), _) => bail!("failed to read file {}", err), //TODO: Better error
-                                };
-                            }
+                            let hash : [u8;CHECKSUM_SIZE] = blake3::Hasher::new()
+                                .update_mmap_rayon(&path).with_context(||anyhow!("checksumming file {}", path.display()))?   // mmaps the file + hashes it multithreaded
+                                .finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
+                            trace!("Real file hashsum {:?}", hash);
+                            Ok(hash)
                         }
                         OwnedSource::FileSet(buf) => {
+                            let mut hasher = blake3::Hasher::new();
                             hasher.update(buf);
+                            let hash = hasher.finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
+                            trace!("Real fileset hashsum {:?}", hash);
+                            Ok(hash)
                         }
                     }
-                    Ok(hasher.finalize().as_bytes()[0..CHECKSUM_SIZE]
-                        .try_into()
-                        .unwrap())
                 }
-                ChecksummingState::Finished(sum) => Ok(*sum),
+                ChecksummingState::Finished(sum, hashed_bytes) => {
+                    match source {
+                        OwnedSource::Path(path) => {
+
+                            let hash : [u8;CHECKSUM_SIZE] = blake3::Hasher::new()
+                                .update_mmap_rayon(&path).with_context(||anyhow!("checksumming file {}", path.display()))?   // mmaps the file + hashes it multithreaded
+                                .finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
+
+                            let mut hasher2 = blake3::Hasher::new();
+                            hasher2.update(hashed_bytes);
+                            let hash2 : [u8;CHECKSUM_SIZE] = hasher2.finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
+
+
+                            trace!("Hashed bytes: {}", path.display()/*, String::from_utf8_lossy(hashed_bytes)*/);
+                            trace!("Real file hashsum (finished) {:?}, of hashed bytes: {:?}", hash, hash2);
+                            assert_eq!(&hash, sum);
+                            Ok(hash)
+                        }
+                        OwnedSource::FileSet(buf) => {
+                            let mut hasher = blake3::Hasher::new();
+                            hasher.update(buf);
+                            let hash = hasher.finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
+                            //println!("Hashed bytes: {:?}", hashed_bytes);
+                            //println!("Real fileset hashsum (finished) {:?}", hash);
+                            assert_eq!(&hash, sum);
+                            Ok(hash)
+                        }
+                    }
+                    //TODO: Use calculated hash
+                    //Ok(*sum)
+                },
             }
         }
     }
@@ -892,6 +973,8 @@ mod server {
 
         multicast_socket: Arc<compio::net::UdpSocket>,
         unicast_socket: Arc<compio::net::UdpSocket>,
+
+        time_when_last_out_of_date_retransmit_gen_accepted: Instant,
     }
 
     impl ServerLogicState {
@@ -937,10 +1020,17 @@ mod server {
             }
 
             if r.retransmit_generation.0 != self.current_retransmit_generation.0 + 1 {
-                trace!("ignore retransmit generation {} because current is {}",
+                if self.time_when_last_out_of_date_retransmit_gen_accepted.elapsed() > Duration::from_secs(1) {
+                    self.time_when_last_out_of_date_retransmit_gen_accepted = Instant::now();
+                }
+                else {
+                    trace!("ignore retransmit generation {} because current is {}",
                     r.retransmit_generation.0, self.current_retransmit_generation.0);
-                return Ok(());
+                    return Ok(());
+                }
             }
+
+            self.current_retransmit_generation = r.retransmit_generation;
 
             if self.pack_leader != src {
                 trace!("peer {:?} is not pack leader {:?}. ", src, self.pack_leader);
@@ -1037,7 +1127,7 @@ mod server {
                             let msg = Message::Payload(pkt);
                             buf_inner.clear();
                             msg.msg_serialize(&mut buf_inner);
-                            trace!("server sending {} byte payload: {:?}", buf_inner.len(), msg);
+                            trace!("server sending {} byte payload.", buf_inner.len());
 
                             buf = Some(
                                 match socket
@@ -1095,6 +1185,7 @@ mod server {
                     pacing: Pacing::default(),
                     unicast_socket: unicast_socket.clone(),
                     multicast_socket: main_socket.clone(),
+                    time_when_last_out_of_date_retransmit_gen_accepted: Instant::now(),
                 },
                 //TODO: don't store sessionid twice
                 session_id,
@@ -1118,7 +1209,7 @@ mod server {
                     buf.reserve(MTU_USIZE);
                     buf = match main_socket.recv_from(buf).await.into_parts() {
                         (Ok((size, src)), mut rbuf) => {
-                            trace!("server received {}/{} byte packet on multicast: {:?}", size, rbuf.len(), rbuf);
+                            trace!("server received {}/{} byte packet on multicast", size, rbuf.len());
                             assert_eq!(size, rbuf.len());
                             let msg = Message::msg_deserialize(rbuf.split().freeze()).expect("corrupt message"); //TODO: Fix error hadnling
                             match msg {
@@ -1274,7 +1365,10 @@ mod client {
 
     pub const WRITE_BUFFER_SIZE_PACKETS: usize = 100;
     pub const HASHER_BUFFER_SIZE_PACKETS: usize = 100;
-    pub const WRITE_WORKERS: usize = 20;
+
+    /// TODO: Activate all workers again, just make sure one worker doesn't report
+    /// file complete while it's written by others
+    pub const WRITE_WORKERS: usize = 1;
 
     impl FileSetDiskWriter {
         pub async fn new(
@@ -1300,6 +1394,7 @@ mod client {
                             .finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
                         if hash != sum.bytes() {
                             // TODO: better error handling?
+                            trace!("Actual received file contents: {}", std::fs::read_to_string(&path).unwrap());
                             panic!("Hash mismatch for {}. Should: {:?}, was: {:?}", path.display(),
                                 sum.bytes(), hash
                             );
@@ -1376,8 +1471,8 @@ mod client {
                                     let bytes_now_progress = bytes_now.len();
 
 
-                                    let curfile = curfile.as_mut().unwrap();
-                                    let checksum_bytes = (need.file_offset + bytes_now.len() as u64).saturating_sub(need.file_size - CHECKSUM_SIZE_U64);
+                                    let curfile_ref = curfile.as_mut().unwrap();
+                                    let checksum_bytes = (need.file_offset + bytes_now.len() as u64).saturating_sub(need.file_size - CHECKSUM_SIZE_U64).min(bytes_now.len() as u64);
 
                                     if checksum_bytes > 0 {
                                         let checksum_byte_ref = &bytes_now[bytes_now.len()-checksum_bytes as usize..];
@@ -1389,7 +1484,7 @@ mod client {
                                         _ = bytes_now.split_off(bytes_now.len() - checksum_bytes as usize);
                                     }
 
-                                    match curfile.file.write_all_at(bytes_now, need.file_offset).await.into_parts() {
+                                    match curfile_ref.file.write_all_at(bytes_now, need.file_offset).await.into_parts() {
                                         (Ok(_), _buf) => {
 
                                         },
@@ -1399,7 +1494,18 @@ mod client {
                                     };
 
                                     if contains(completed_range.clone(), need.file_range.clone()) {
-                                        trace!("detected that file {} was complet, because completed range is {:?} and file range is {:?}", need.path.display(), completed_range, need.file_range);
+                                        let mut f = curfile.take().unwrap();
+                                        //TODO: Make sure empty directories are created.
+                                        // Could do as a pass when receiving bytes before empty dir in sequence
+                                        f.file.set_len(need.file_size-CHECKSUM_SIZE_U64).await?;
+                                        f.file.close().await?;
+                                        //TODO: Change expensive asserts to debug_assert
+                                        assert_eq!(need.file_range.end.0-need.file_range.start.0, need.file_size);
+                                        debug_assert_eq!(
+                                            std::fs::metadata(need.path).unwrap().len(),
+                                            need.file_size - CHECKSUM_SIZE_U64
+                                        );
+                                        trace!("detected that file {} was complete, because completed range is {:?} and file range is {:?}", need.path.display(), completed_range, need.file_range);
                                         hasher_tx.send_async((need.checksum.clone(), need.path.to_path_buf())).await.expect("hashers do not die");
                                     }
 
@@ -1475,14 +1581,20 @@ mod client {
 
             let mut sendbuf = BytesMut::new();
 
-            async fn send_request(mut buf: BytesMut, send_socket: &UdpSocket, phase: u16, session_id: SessionId, missing: &RangeSet<PhaseOffset>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4) -> Result<BytesMut> {
+            async fn send_request(mut buf: BytesMut, send_socket: &UdpSocket, phase: u16, session_id: SessionId, missing: impl Iterator<Item=&Range<PhaseOffset>>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4) -> Result<BytesMut> {
                 let mut sections = ArrayVec::new();
-                for rng in missing.iter() {
+                for rng in missing {
                     let start = rng.start.floor_index();
                     let end = rng.end.ceil_index();
+                    println!("Requesting {:?}", start..end);
                     if sections.try_push(start..end).is_err() {
                         break;
                     }
+                }
+                if sections.is_empty() {
+                    // this can happen if we're processing a 'eof approaching' but there's
+                    // actually nothing more to send.
+                    return Ok(buf);
                 }
                 let request = Message::Request(Request {
                     session_id,
@@ -1508,9 +1620,14 @@ mod client {
 
             }
             let mut last_retransmit_generation = RetransmitGeneration(0);
+            /// We avoid stepping the generation back. But in degenerate cases,
+            /// we may have to, to avoid getting stuck. So keep a retry count.
+            let mut last_retransmit_generation_update_counter = 0;
             let mut loss: LinkQualitySignal = LinkQualitySignal::KeepGoing;
             let mut no_loss_counter = 0;
+
             for (phase, phase_size) in phases {
+                let mut most_recent_request = PhaseOffset::ZERO..PhaseOffset::ZERO;
                 let mut recvbuf = BytesMut::new();
                 'phaseloop: loop {
                     recvbuf.clear();
@@ -1527,7 +1644,7 @@ mod client {
                             trace!("client experienced idle server");
                             let phase_missing = &missing[*phase as usize];
                             sendbuf = send_request(sendbuf,&send_socket, *phase, session_id,
-                                                   phase_missing, last_retransmit_generation, loss, peer
+                                                   phase_missing.iter(), last_retransmit_generation, loss, peer
                             ).await?;
                             loss = LinkQualitySignal::KeepGoing;
                             recvbuf = BytesMut::new();
@@ -1549,47 +1666,74 @@ mod client {
                                         error!("ignore request");
                                     }
                                     Message::Payload(p) => {
-                                        let range_start = calculate_phase_offset(p.index.index());
-                                        let range = range_start..PhaseOffset(range_start.0 + p.data.len() as u64);
-                                        let phase_missing = &mut missing[*phase as usize];
-                                        let holes_before = phase_missing.len();
+                                        if p.index.phase() != *phase {
+                                        } else {
+                                            let retransmit_gen_delta = p.retransmit_generation.0.wrapping_sub(last_retransmit_generation.0);
 
-                                        //TODO: Implement leadership support for client too
+                                            //TODO: Magic values
+                                            if retransmit_gen_delta < u16::MAX - 100 || last_retransmit_generation_update_counter > 100 {
+                                                last_retransmit_generation = p.retransmit_generation;
+                                            } else {
+                                                last_retransmit_generation_update_counter += 1;
+                                            }
 
-                                        let mut was_useful = false;
-                                        if phase_missing.overlaps(&range) {
-                                            was_useful = true;
-                                        }
+                                            let range_start = calculate_phase_offset(p.index.index());
+                                            let range = range_start..PhaseOffset(range_start.0 + p.data.len() as u64);
 
-                                        phase_missing.remove(range.clone());
-                                        let holes_after = phase_missing.len();
-                                        if holes_after != holes_before {
-                                            loss = LinkQualitySignal::LossDetected;
-                                            no_loss_counter = 0;
-                                        } else if was_useful {
-                                            no_loss_counter += 1;
-                                            if no_loss_counter > 100 && loss == LinkQualitySignal::KeepGoing {
-                                                loss = LinkQualitySignal::IncreaseWindow;
-                                                no_loss_counter = 0;
+                                            trace!("client received payload for range {:?} (data len {})", range, p.data.len());
+                                            let phase_missing = &mut missing[*phase as usize];
+                                            let holes_before = phase_missing.len();
+
+                                            //TODO: Implement leadership support for client too
+
+
+                                            if phase_missing.overlaps(&range) {
+                                                trace!("received packet was useful");;
+
+                                                phase_missing.remove(range.clone());
+                                                let holes_after = phase_missing.len();
+                                                if holes_after != holes_before {
+                                                    loss = LinkQualitySignal::LossDetected;
+                                                    no_loss_counter = 0;
+                                                } else {
+                                                    no_loss_counter += 1;
+                                                    if no_loss_counter > 100 && loss == LinkQualitySignal::KeepGoing {
+                                                        loss = LinkQualitySignal::IncreaseWindow;
+                                                        no_loss_counter = 0;
+                                                    }
+                                                }
+
+                                                let missing_range_end = phase_missing.overlapping(range.end..PhaseOffset::MAX_OFFSET).next().cloned();
+                                                let missing_range_start = phase_missing.overlapping(PhaseOffset::ZERO..range.start).rev().next().cloned();
+                                                trace!("search for missing tree: {:?}", phase_missing);
+                                                trace!("search for missing after {:?} got {:?}", range.end, missing_range_end);
+                                                trace!("search for missing before {:?} got {:?}", range.start, missing_range_start);
+                                                let consecutive_non_missing_range = missing_range_start.map(|x| x.end).unwrap_or(PhaseOffset::ZERO)..missing_range_end.map(|x| x.start).unwrap_or(PhaseOffset::MAX_OFFSET);
+                                                trace!("current gap - non-missing offsets: {:?}", consecutive_non_missing_range);
+                                                assert!(consecutive_non_missing_range.start <= consecutive_non_missing_range.end);
+
+                                                receiver.write(p.index, p.data, consecutive_non_missing_range).await?;
+
+                                                if p.eof_approaching != PacketIdx::INVALID {
+                                                    println!("Eof approaching");
+                                                    let next_to_send = p.eof_approaching;
+                                                    assert_eq!(next_to_send.phase(), *phase); //TODO: Error handling
+
+                                                    let allowed_range_start = calculate_phase_offset(next_to_send.index());
+                                                    let modified_missing = phase_missing.overlapping(allowed_range_start..PhaseOffset::MAX_OFFSET);
+
+                                                    sendbuf = send_request(sendbuf, &send_socket, *phase, session_id,
+                                                                           modified_missing, last_retransmit_generation, loss.clone(), peer
+                                                    ).await?;
+                                                }
+                                                {
+                                                    if phase_missing.is_empty() {
+                                                        debug!("Client exiting phase loop for phase {}", phase);
+                                                        break 'phaseloop;
+                                                    }
+                                                }
                                             }
                                         }
-
-                                        let gap_end = phase_missing.overlapping(range.end..PhaseOffset::MAX_OFFSET).next().cloned().unwrap_or(range.start..PhaseOffset::MAX_OFFSET);
-                                        let gap_start = phase_missing.overlapping(PhaseOffset(0)..range.start).rev().next().cloned().unwrap_or(PhaseOffset(0)..range.end);
-                                        trace!("search for missing tree: {:?}", phase_missing);
-                                        trace!("search for missing after {:?} got {:?}", range.end, gap_end);
-                                        trace!("search for missing before {:?} got {:?}", range.start, gap_start);
-                                        let gap = gap_start.end..gap_end.start;
-
-                                        receiver.write(p.index, p.data, gap).await?;
-
-                                        if was_useful {
-                                            if phase_missing.is_empty() {
-                                                debug!("Client exiting phase loop for phase {}", phase);
-                                                break 'phaseloop;
-                                            }
-                                        }
-
                                     }
                                     Message::Announce(_) => {
                                         error!("ignore announce");
@@ -1707,9 +1851,12 @@ mod client {
                                                     &mut buf, &[(0,PhaseOffset(phase_0_size as u64))], server
                         ).await?;
 
-                        let checksum = blake3::hash(&buf[..buf.len()-CHECKSUM_SIZE]).as_bytes()[0..16].to_vec();
-                        if &checksum != &buf[buf.len()-CHECKSUM_SIZE..] {
-                            bail!("Checksum mismatch - network corruption?");
+                        let calculated_checksum = blake3::hash(&buf[..buf.len()-CHECKSUM_SIZE]).as_bytes()[0..16].to_vec();
+                        let received_checksum = &buf[buf.len()-CHECKSUM_SIZE..];
+                        if &calculated_checksum != received_checksum {
+                            bail!("Checksum mismatch - network corruption? Calculated checksum: {:?}, received: {:?}",
+                                calculated_checksum, received_checksum
+                            );
                         }
 
                         let mut fileset: FileSet = Deserializer::bare_deserialize(&mut buf.reader(), 0)?;
@@ -1862,7 +2009,7 @@ mod file_set {
 
     impl RFile {
         pub fn range(&self) -> Range<PhaseOffset> {
-            (self.offset..self.offset + self.size).into()
+            self.offset..self.offset + self.size
         }
     }
 
@@ -1987,6 +2134,7 @@ mod file_set {
         // Size *including* checksum
         pub file_size: u64,
         pub checksum: &'a AtomicChecksum,
+        /// PhaseOffset range occupied by complete file (including checksum)
         pub file_range: Range<PhaseOffset>,
     }
 
@@ -2063,14 +2211,12 @@ mod file_set {
 
     impl PhaseSize for FileSet {
         /// Returns None if phase is empty
-        fn max_index_eclusive(&self, phase: u16) -> Option<PhaseOffset> {
-            Some(PhaseOffset(
+        fn max_offset_exclusive(&self, phase: u16) -> Option<PhaseOffset> {
+            Some(
                 self.phases[phase as usize]
                     .entry
                     .last_offset_exclusive()
-                    .0
-                    .div_ceil(crate::PAYLOAD_SIZE),
-            ))
+            )
         }
     }
 
@@ -2245,6 +2391,7 @@ mod file_set {
             if range.start >= self.last_offset_exclusive() {
                 bail!("Range {range:?} not present in Entry");
             }
+
             match self {
                 Entry::File(f) => {
                     if let Some(overlap) = overlaps(f.range(), range.clone()) {
@@ -2289,10 +2436,10 @@ mod file_set {
                     Ok(())
                 }
                 Entry::FileSet(Some(buf)) => {
-                    if let Some(overlap) = overlaps(PhaseOffset(0)..PhaseOffset(buf.len() as u64), range.clone()) {
+                    if let Some(overlap) = overlaps(PhaseOffset(0)..PhaseOffset(buf.len() as u64 + CHECKSUM_SIZE_U64), range.clone()) {
                         let offset = PhaseOffset(0);
-                        let size = buf.len() as u64;
-                        func(overlap.clone(), Source::FileSet(buf), overlap.start - offset, size + CHECKSUM_SIZE_U64, Kind::FileSet);
+                        let size = buf.len() as u64 + CHECKSUM_SIZE_U64;
+                        func(overlap.clone(), Source::FileSet(buf), overlap.start - offset, size, Kind::FileSet);
                     }
                     Ok(())
                 }
