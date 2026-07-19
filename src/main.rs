@@ -208,6 +208,7 @@ mod messages {
     const MAX_SECTIONS_PER_PAYLOAD: usize = 5;
 
     #[derive(Savefile, PartialEq, Debug, Clone)]
+    #[repr(u8)]
     pub enum LinkQualitySignal {
         KeepGoing,
         IncreaseWindow,
@@ -242,7 +243,7 @@ mod messages {
         /// Size of a 0-payload `Message::Payload` message.
         ///
         /// Includes Message tag and payload size field.
-        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 2 + 8 + 1 + 8 + 8;
+        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 2 + 8 + 8 + 8;
     }
 
     #[derive(Savefile, PartialEq, Debug)]
@@ -273,38 +274,9 @@ mod messages {
             }
         }
         pub fn msg_serialize(&self, output: &mut BytesMut) {
+            let bef = output.len();
             Serializer::bare_serialize(&mut output.writer(), 0, self).unwrap();
-            assert!(output.len() <= MTU_USIZE, "output was {} but MTU is {}", output.len(), MTU_USIZE);
-            /*match self {
-                Message::Request(r) => {
-                    output.put_u8(0);
-                    output.put_u32(r.session_id);
-                    output.put_u16(r.retransmit_generation);
-                    output.put_u16(r.phase);
-                    output.put_u8(r.sections.len() as u8);
-                    for section in &r.sections {
-                        output.put_u64(section.start);
-                        output.put_u64(section.end - section.start);
-                    }
-                }
-                Message::Payload(p) => {
-                    output.put_u8(1);
-                    output.put_u32(p.session_id);
-                    output.put_u16(p.retransmit_generation);
-                    p.index.serialize(output);
-                    output.extend_from_slice(&p.data)
-                }
-                Message::Announce(a) => {
-                    output.put_u8(2);
-                    output.put_u32(a.session_id);
-                    output.put_u16(a.retransmit_generation);
-                    output.put_u64(a.file_count);
-                    output.put_u64(a.total_size_bytes);
-                }
-                Message::RequestAnnounce => {
-                    output.put_u8(3);
-                }
-            }*/
+            assert!(output.len() - bef <= MTU_USIZE, "output was {} but MTU is {}", output.len(), MTU_USIZE);
         }
 
         pub fn msg_deserialize(mut input: Bytes) -> Result<Message> {
@@ -312,55 +284,6 @@ mod messages {
             let t= Ok(Deserializer::bare_deserialize(&mut input.reader(), 0)?);
 
             t
-            /*
-
-            match input.try_get_u8()? {
-                0 => {
-                    let session_id = input.try_get_u32()?;
-                    let logical_time = input.try_get_u16()?;
-                    let phase = input.try_get_u16()?;
-                    let section_count: usize = input.try_get_u8()? as usize;
-                    let mut sections = ArrayVec::new();
-                    for _ in 0..section_count {
-                        sections.push(
-                            (input.try_get_u64()?..input.try_get_u64()?).into()
-                        )
-                    }
-                    Ok(Message::Request(Request {
-                        session_id,
-                        retransmit_generation: logical_time,
-                        phase,
-                        sections,
-                    }))
-                }
-                1 => {
-                    let session_id = input.try_get_u32()?;
-                    let logical_time = input.try_get_u16()?;
-                    let index = PacketIdx::deserialize(&mut input)?;;
-                    Ok(Message::Payload(Payload {
-                        session_id,
-                        retransmit_generation: logical_time,
-                        index,
-                        data: input,
-                    }))
-                }
-                2 => {
-                    let session_id = input.try_get_u32()?;
-                    let logical_time = input.try_get_u16()?;
-                    let file_count = input.try_get_u64()?;
-                    let total_size_bytes = input.try_get_u64()?;
-                    Ok(Message::Announce(Announce {
-                        session_id,
-                        retransmit_generation: logical_time,
-                        file_count,
-                        total_size_bytes,
-                    }))
-                }
-                3 => {
-                    Ok(Message::RequestAnnounce)
-                }
-                _ => bail!("Unexpected message type"),
-            }*/
         }
     }
     #[cfg(test)]
@@ -479,6 +402,7 @@ mod disk_read_engine {
 
     pub struct ReadEngine {
         files: Arc<FileSet>,
+        //TODO: GC?
         checksums: HashMap<OwnedSourceId, ChecksummingState>,
     }
 
@@ -580,10 +504,10 @@ mod disk_read_engine {
 
         pub fn get_packets(
             &mut self,
-            logical_time: RetransmitGeneration,
+            retransmit_generation: RetransmitGeneration,
             session_id: SessionId,
             idx: Range<PacketIdx>,
-            mut tx: impl FnMut(Payload),
+            mut tx: impl Fn(Payload),
         ) -> Result<()> {
             //TODO: Reuse these buffers
             let mut tasks = Vec::new();
@@ -608,6 +532,7 @@ mod disk_read_engine {
             let mut output_idx = idx.clone();
 
             let task_len = tasks.len();
+
             for (task_i, (phase, phase_offset, source, offset, nominal_file_size, kind)) in
                 tasks.into_iter().enumerate()
             {
@@ -720,8 +645,8 @@ mod disk_read_engine {
                 assert_eq!(
                     buf.len() - buflen,
                     full_chunk_size as usize
-                )
-                ;
+                );
+                
                 while !buf.is_empty() && ( task_i + 1 == task_len || buf.len() >= PAYLOAD_SIZE_USIZE ) {
                     let pktbuf =
                         buf.split_to(PAYLOAD_SIZE_USIZE.min(buf.len())).freeze();
@@ -732,7 +657,7 @@ mod disk_read_engine {
                     debug!("Sending {:?} eof {}", output_idx.start, eof_approaching.is_some());
                     tx(Payload {
                         session_id,
-                        retransmit_generation: logical_time,
+                        retransmit_generation,
                         index: output_idx.start,
                         eof_approaching: eof_approaching.unwrap_or(PacketIdx::INVALID),
                         data: pktbuf,
@@ -797,6 +722,8 @@ mod disk_read_engine {
                     }
                 }
                 ChecksummingState::Finished(sum, hashed_bytes) => {
+                    #[cfg(debug_assertions)]
+                    // TODO: Remove duplicate code
                     match source {
                         OwnedSource::Path(path) => {
 
@@ -812,18 +739,16 @@ mod disk_read_engine {
                             trace!("Hashed bytes: {}", path.display()/*, String::from_utf8_lossy(hashed_bytes)*/);
                             trace!("Real file hashsum (finished) {:?}, of hashed bytes: {:?}", hash, hash2);
                             assert_eq!(&hash, sum);
-                            Ok(hash)
                         }
                         OwnedSource::FileSet(buf) => {
                             let mut hasher = blake3::Hasher::new();
                             hasher.update(buf);
-                            let hash = hasher.finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
-                            //println!("Hashed bytes: {:?}", hashed_bytes);
-                            //println!("Real fileset hashsum (finished) {:?}", hash);
+                            let hash: [u8;16] = hasher.finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
+
                             assert_eq!(&hash, sum);
-                            Ok(hash)
                         }
                     }
+                    Ok(*sum)
                     //TODO: Use calculated hash
                     //Ok(*sum)
                 },
@@ -834,22 +759,25 @@ mod disk_read_engine {
 
 mod server {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::num::NonZeroUsize;
     use std::ops::Range;
+    use std::panic::PanicHookInfo;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use crate::disk_read_engine::ReadEngine;
     use crate::file_set::{FileSet, Meta};
-    use crate::messages::{Announce, LinkQualitySignal, Message, Request};
-    use crate::{overlaps, PacketIdx, RetransmitGeneration, SessionId, DEFAULT_BIND_ADDRESS, MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, DEFAULT_MCAST_ADDR};
+    use crate::messages::{Announce, LinkQualitySignal, Message, Payload, Request};
+    use crate::{overlaps, PacketIdx, RetransmitGeneration, SessionId, DEFAULT_BIND_ADDRESS, MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, DEFAULT_MCAST_ADDR, PhaseOffset};
     use anyhow::{Result, bail};
     use bytes::{Bytes, BytesMut};
+    use lru::LruCache;
     use rangemap::RangeMap;
     use savefile::Serialize;
     use smallvec::SmallVec;
-    use tokio::spawn;
-    use tracing::{debug, error, info, trace};
+    use tokio::{select, spawn};
+    use tracing::{debug, error, info, trace, warn};
     use crate::util::{reusable_multicast_socket, unicast_socket, TSocket, BSocket, blocking_socket, tokio_socket};
 
     #[derive(Clone, Debug)]
@@ -877,7 +805,6 @@ mod server {
         session_id: SessionId,
         multicast_socket: Arc<TSocket>,
 
-        unicast_socket: Arc<TSocket>,
     }
 
     struct Pacing {
@@ -902,7 +829,7 @@ mod server {
                 }
                 LinkQualitySignal::LossDetected => {
                     self.buffer_size_packets = (self.buffer_size_packets / 2).max(MIN_BURST_SIZE);
-                    println!("Reduce buffer size to {:?}", self.buffer_size_packets);
+                    trace!("Reduce buffer size to {:?}", self.buffer_size_packets);
                 }
             }
         }
@@ -923,9 +850,11 @@ mod server {
 
         //TODO: Remove these?
         multicast_socket: Arc<TSocket>,
-        unicast_socket: Arc<TSocket>,
+
 
         time_when_last_out_of_date_retransmit_gen_accepted: Instant,
+
+        meta: Meta,
     }
 
     impl ServerLogicState {
@@ -956,6 +885,7 @@ mod server {
             }
         }
         fn process_request(&mut self, r: Request, src: SocketAddr) -> Result<()> {
+            println!("Server received req: {:?}", r);
             if r.sections.is_empty() {
                 bail!("empty request");
             }
@@ -970,18 +900,21 @@ mod server {
                 self.packet_leader_position = first_idx;
             }
 
-            if r.retransmit_generation.0 != self.current_retransmit_generation.0 + 1 {
+            if r.retransmit_generation.0 != self.current_retransmit_generation.0 {
+                trace!("Retransmit gen mismatch, {} vs {}",  r.retransmit_generation.0, self.current_retransmit_generation.0 );
+                //TODO: Constants
                 if self.time_when_last_out_of_date_retransmit_gen_accepted.elapsed() > Duration::from_secs(1) {
+                    trace!("Retransmit gen mismatch timer elapsed");
                     self.time_when_last_out_of_date_retransmit_gen_accepted = Instant::now();
                 }
                 else {
                     trace!("ignore retransmit generation {} because current is {}",
-                    r.retransmit_generation.0, self.current_retransmit_generation.0);
+                        r.retransmit_generation.0, self.current_retransmit_generation.0);
                     return Ok(());
                 }
             }
 
-            self.current_retransmit_generation = r.retransmit_generation;
+            self.current_retransmit_generation = self.current_retransmit_generation.next();
 
             if self.pack_leader != src {
                 trace!("peer {:?} is not pack leader {:?}. ", src, self.pack_leader);
@@ -1003,7 +936,7 @@ mod server {
             }
 
             self.send(
-                r.retransmit_generation,
+                self.current_retransmit_generation,
                 r.sections.into_iter().map(|offset_range| {
                     PacketIdx::new(r.phase, offset_range.start)
                         ..PacketIdx::new(r.phase, offset_range.end)
@@ -1025,15 +958,50 @@ mod server {
                     self.process_request(r, src)?;
                 }
                 Message::Payload(_) => {}
-                Message::Announce(_) => {}
+                Message::Announce(_) => {
+                }
                 Message::RequestAnnounce => {
-                    error!("Server got announce request on unicast");
+                    ServerState::process_request_announce(self.session_id, &self.multicast_socket, src, &self.meta).await.expect("process request announce"); //TODO: Fix error hadnling
                 }
             }
 
             Ok(())
         }
     }
+
+
+    struct Accumulate {
+        socket: Arc<BSocket>,
+        max_buf_size_bytes: usize,
+        send_buf: BytesMut,
+        config: ServerConfig
+    }
+
+impl Accumulate {
+    pub fn send(&mut self, payload: Payload) {
+        let msg = Message::Payload(payload);
+        let size_before = self.send_buf.len();
+        msg.msg_serialize(&mut self.send_buf);
+        let packet_size = self.send_buf.len() - size_before;
+
+        if !self.send_buf.is_empty() && (packet_size != MTU_USIZE || self.send_buf.len() + MTU_USIZE > self.max_buf_size_bytes) {
+            trace!("Sending {} packets, rem: {}", self.send_buf.len().div_ceil(MTU_USIZE), self.send_buf.len()%MTU_USIZE);
+            self.flush()
+        }
+    }
+    pub fn flush(&mut self) {
+        if !self.send_buf.is_empty() {
+            trace!("Sending {} final packets to {:?}", self.send_buf.len().div_ceil(MTU_USIZE), SocketAddr::V4(self.config.mcast_addr));
+            if let Err(err) = self.socket
+                .send_to(&self.send_buf, SocketAddr::V4(self.config.mcast_addr)) {
+                error!("Failed to send {} byte buffer: {:?}", self.send_buf.len(), err);
+                return;
+            }
+            //std::thread::sleep(Duration::from_secs(1));
+            self.send_buf.clear();
+        }
+    }
+}
 
     impl ServerState {
         async fn process_request_announce(
@@ -1063,43 +1031,111 @@ mod server {
             socket: Arc<BSocket>,
         ) -> Result<()> {
 
+
+            //let max_buf_size_bytes = socket.max_send_batch() * MTU_USIZE;
+
+
+            // Max GSO size is UDP max payload minus ip header + udp header
+            const MAX_GSO_BYTES: usize = (u16::MAX as usize) - 8 - 20;
+            // TODO: Terminology "send_batch" what is that?
+            let max_buf_size_bytes = (socket.max_send_batch() * MTU_USIZE).min(MAX_GSO_BYTES);
+            debug!("Max buf size: {}", max_buf_size_bytes);
+
+            // TODO: Introduce constant
+            let (socket_send_tx, socket_send_rx) = flume::bounded::<SendEvent>(1000);
+
+            enum SendEvent {
+                Prepare(Range<PacketIdx>),
+                Payload(Payload)
+            }
+
             std::thread::spawn(move||{
-                const BATCH_SIZE : usize = 100;
-                // TODO: Introduce constant
-                let mut send_buf = BytesMut::with_capacity(BATCH_SIZE*MTU_USIZE);
+                let mut accumulator = Accumulate {
+                    socket,
+                    max_buf_size_bytes,
+                    send_buf: BytesMut::with_capacity(max_buf_size_bytes),
+                    config,
+                };
+                let mut cur_range = PacketIdx::INVALID .. PacketIdx::INVALID;
+                #[derive(Clone)]
+                enum PayloadBucket {
+                    Awaiting,
+                    Present(Payload),
+                    Sent
+                }
+                let mut payloads = vec![];
+                let mut pointer = 0;
+                loop {
+                    let pre_recv_work = Instant::now();
+                    let Ok(ev) = socket_send_rx.recv() else {
+                        info!("exiting socket send thread");
+                        return;
+                    };
+                    if pre_recv_work.elapsed().as_millis() > 1 {
+                        trace!("Receiving new work took {:?}", pre_recv_work.elapsed());
+                    }
+                    match ev {
+                        SendEvent::Prepare(rng) => {
+                            debug_assert!(cur_range.is_empty());
+                            assert_eq!(rng.start.phase(), rng.end.phase());
+                            payloads.clear();
+                            cur_range = rng.clone();
+                            payloads.resize((rng.end.0 - rng.start.0) as usize, PayloadBucket::Awaiting);
+                            pointer = 0;
+                        }
+                        SendEvent::Payload(p) => {
+                            assert!(p.index >= cur_range.start);
+                            assert!(p.index < cur_range.end);
+                            let offset = (p.index.0 - cur_range.start.0) as usize;
+                            if matches!(payloads[offset], PayloadBucket::Awaiting) {
+                                payloads[offset] = PayloadBucket::Present(p);
+                            }
+                        }
+                    }
+
+                    while pointer < payloads.len() && let PayloadBucket::Present(pkt) = &payloads[pointer] {
+                        let PayloadBucket::Present(pkt) = std::mem::replace(&mut payloads[pointer], PayloadBucket::Sent) else {
+                            unreachable!();
+                        };
+                        accumulator.send(pkt);
+                        pointer += 1;
+                    }
+                    if pointer == payloads.len() {
+                        accumulator.flush();
+                    }
+                }
+            });
+
+
+
+            std::thread::spawn(move||{
+
+
+                //let mut prefetched_range: LruCache<PacketIdx, Payload> = LruCache::new(NonZeroUsize::new(1000).unwrap());
                 loop {
 
                     let Ok((generation, pkts)) = rx.recv() else {
                         info!("worker exiting");
                         return;
                     };
+
+
                     trace!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
+                    println!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
+                    let bef_gp = Instant::now();
+
+                    _ = socket_send_tx.send(SendEvent::Prepare(pkts.clone()));
+
+
+
                     let result = read_engine
                         .get_packets(generation, session_id, pkts, |pkt| {
-
-                            let msg = Message::Payload(pkt);
-                            let size_before = send_buf.len();
-                            msg.msg_serialize(&mut send_buf);
-                            let packet_size = send_buf.len() - size_before;
-
-                            if packet_size != MTU_USIZE || send_buf.len() + MTU_USIZE >= BATCH_SIZE*MTU_USIZE {
-                                if let Err(err) = socket
-                                    .send_to(&send_buf, SocketAddr::V4(config.mcast_addr)) {
-                                    error!("Failed to send {} byte buffer: {:?}", send_buf.len(), err);
-                                    return;
-                                }
-                                send_buf.clear();
-                            }
+                            _ = socket_send_tx.send(SendEvent::Payload(pkt));
                         });
 
-                    if !send_buf.is_empty() {
-                        if let Err(err) = socket
-                            .send_to(&send_buf, SocketAddr::V4(config.mcast_addr)) {
-                            error!("Failed to send {} byte buffer: {:?}", send_buf.len(), err);
-                            return;
-                        }
-                        send_buf.clear();
-                    }
+                    let bef_el = bef_gp.elapsed();
+                    //println!("get_packets took: {:?} send took {:?}, get itself {:?}", bef_el, send_took, bef_el - send_took);
+
 
 
                     trace!("file fetching worker done");
@@ -1112,20 +1148,23 @@ mod server {
             Ok(())
         }
         pub async fn run(config: ServerConfig) -> Result<()> {
+
+
             let (tx, rx) = flume::unbounded();
+
             let session_id = SessionId::make_random();
 
-            let unicast_socket = Arc::new(tokio_socket(unicast_socket(config.local_iface)?)?);
 
-            let unicast_socket2 = Arc::new(blocking_socket(crate::util::unicast_socket(config.local_iface)?)?);
+            let unicast_socket = Arc::new(blocking_socket(crate::util::unicast_socket(config.local_iface)?)?);
 
-            let main_socket = Arc::new(tokio_socket(reusable_multicast_socket(config.mcast_addr, config.local_iface)?)?);
+            let main_socket = Arc::new(tokio_socket(reusable_multicast_socket(config.mcast_addr, config.local_iface, true)?)?);
 
-            info!("collecing file list");
+            info!("collecting file list");
             let mut files = FileSet::new(config.phases.clone())?;
 
             info!("Full Fileset: {:#?}", files);
 
+            let meta = files.calculate_meta_and_assign_fileset_buf()?;
             let mut state = ServerState {
                 config,
                 logic_state: ServerLogicState {
@@ -1137,26 +1176,26 @@ mod server {
                     packet_leader_position: PacketIdx(0),
                     pack_leader_last_head: Instant::now(),
                     pacing: Pacing::default(),
-                    unicast_socket: unicast_socket.clone(),
+
                     multicast_socket: main_socket.clone(),
                     time_when_last_out_of_date_retransmit_gen_accepted: Instant::now(),
+                    meta
                 },
                 //TODO: don't store sessionid twice
                 session_id,
                 multicast_socket: main_socket.clone(),
 
-                unicast_socket: unicast_socket.clone(),
+
             };
 
-            let meta = files.calculate_meta_and_assign_fileset_buf()?;
 
             let re = ReadEngine::new(state.session_id, files).await;
 
             info!("starting file fetching worker");
-            Self::file_fetching_worker(rx, session_id, state.config.clone(), re, unicast_socket2.clone()).await?;
+            Self::file_fetching_worker(rx, session_id, state.config.clone(), re, unicast_socket).await?;
 
 
-            spawn(async move{
+            /*spawn(async move{
                 let mut buf = BytesMut::with_capacity(MTU_USIZE);
                 loop {
                     debug!("Server calling socket.recv_from on multicast socket");
@@ -1165,34 +1204,41 @@ mod server {
                     let (size, src) = match main_socket.recv_single_from(&mut buf).await {
                         Ok(x) => x,
                         Err(err) => {
-                            error!("receive failed");
+                            error!("receive failed: {:?}", err);
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                             continue;
                         }
                     };
 
                     trace!("server received {}/{} byte announce packet on multicast", size, buf.len());
                     assert_eq!(size, buf.len());
-                    let msg = Message::msg_deserialize(buf.split().freeze()).expect("corrupt message"); //TODO: Fix error hadnling
+                    let msg = Message::msg_deserialize(buf.split().freeze()); //TODO: Fix error hadnling
                     match msg {
-                        Message::RequestAnnounce => {
-                            Self::process_request_announce(session_id, &unicast_socket, src, &meta).await.expect("process request announce"); //TODO: Fix error hadnling
+                        Ok(Message::RequestAnnounce) => {
+                            Self::process_request_announce(session_id, &main_socket, src, &meta).await.expect("process request announce"); //TODO: Fix error hadnling
                         }
-                        _ => {
+                        Ok(_) => {
                             debug!("received non-announce-request on multicast socket.");
+                        }
+                        Err(x) => {
+                            warn!("Message deserialize failed: {:?}", x);
                         }
                     }
                 }
-            });
+            });*/
 
 
             //TODO: Move to other method
             let mut buf = BytesMut::with_capacity(MTU_USIZE);
+
             loop {
                 debug!("Server calling socket.recv_from");
                 buf.clear();
                 buf.reserve(MTU_USIZE);
-                let (size, src) = state.unicast_socket.recv_single_from(&mut buf).await?;
-                trace!("server received {}/{} main request packet", size, buf.len());
+                println!("Server calling socket.recv_from");
+                let (size, src) = state.multicast_socket.recv_single_from(&mut buf).await?;
+                println!("server received {}/{} main request packet", size, buf.len());
+
                 assert_eq!(size, buf.len());
                 match state
                     .logic_state
@@ -1527,9 +1573,34 @@ mod client {
 
             let mut sendbuf = BytesMut::new();
 
-            async fn send_request(mut scratchbuf: &mut BytesMut, send_socket: &TSocket, phase: u16, session_id: SessionId, missing: impl Iterator<Item=&Range<PhaseOffset>>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4) -> Result<()> {
+            async fn send_request(mut scratchbuf: &mut BytesMut, send_socket: &TSocket, phase: u16, session_id: SessionId, missing: impl Iterator<Item=&Range<PhaseOffset>>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4, disallowed_range: Option<Range<PhaseOffset>>) -> Result<()> {
                 let mut sections: ArrayVec<Range<IndexInPhase>, {super::messages::MAX_SECTIONS_PER_REQUEST}> = ArrayVec::new();
-                for rng in missing {
+                trace!("Disallowed range: {:?}", disallowed_range);
+                for mut rng in missing.cloned() {
+                    trace!("Considering {:?}", rng);
+                    if let Some(disallowed_range) = &disallowed_range {
+                        if rng.start >= disallowed_range.start && rng.end <= disallowed_range.end {
+                            trace!("wholly contained in disallowed");
+                            continue;
+                        }
+                        if rng.end <= disallowed_range.start || rng.start >= disallowed_range.end {
+                            // completely disjoint from disallowed range
+                        } else {
+                            // disallowed range overlaps
+                            if rng.end > disallowed_range.end {
+                                rng.start = disallowed_range.end;
+                            }
+                            if rng.start < disallowed_range.start {
+                                rng.end = disallowed_range.start;
+                            }
+                            if rng.end <= rng.start {
+                                trace!("wholly contained in disallowed2");
+                                continue;
+                            }
+                        }
+                    }
+                    trace!("cut to: {:?}", rng);
+
                     let mut start = rng.start.floor_index();
                     let end = rng.end.ceil_index();
 
@@ -1550,17 +1621,20 @@ mod client {
                 if sections.is_empty() {
                     // this can happen if we're processing a 'eof approaching' but there's
                     // actually nothing more to send.
+                    trace!("Nothing more to send");
                     return Ok(());
                 }
                 let request = Message::Request(Request {
                     session_id,
                     phase,
-                    retransmit_generation: retransmit_generation.next(),
+                    retransmit_generation,
                     loss,
                     sections
                 });
                 scratchbuf.clear();
                 trace!("sending request: {:?} to {:?}", request, dst);
+                println!("sending request: {:?} to {:?}", request, dst);
+
                 request.msg_serialize(&mut scratchbuf);
                 send_socket.send_to(scratchbuf, SocketAddr::V4(dst)).await?;
                 Ok(())
@@ -1594,12 +1668,17 @@ mod client {
                 socket = Some(recv_socket);
             }*/
 
-            const BATCH_SIZE : usize = 100;
-            let mut iobufs = vec![[0u8;MTU_USIZE]; BATCH_SIZE];
+            const TOTAL_BATCH_SIZE : usize = 64;
+            let gro = recv_socket.match_recv_batch_size();
+            // TODO: Strict terminology GRO/GSO vs whatever recvmmsg is splitting into
+            let batch_size = TOTAL_BATCH_SIZE.div_ceil(gro).max(2);
+            trace!("mmsg batch size: {}", batch_size);
+
+            let mut iobufs = vec![vec![0u8;gro*MTU_USIZE]; batch_size];
 
             let mut io_vec_buffers: Vec<_> = vec![];
 
-            for (i,buf) in (0..BATCH_SIZE).zip(iobufs.iter_mut()) {
+            for (i,buf) in (0..batch_size).zip(iobufs.iter_mut()) {
                 io_vec_buffers.push(IoSliceMut::new(buf))
             }
             let mut meta_scratch = vec![];
@@ -1642,14 +1721,18 @@ mod client {
                     debug!("client socket call completed or timed out");
 
 
-                    let result = tokio::time::timeout(Duration::from_millis(250), recv_socket.recv_multi_from(&mut io_vec_buffers, &mut meta_scratch)).await;
+                    let befrecv = Instant::now();
+                    // TODO: Make this timeout variable
 
+                    let result = tokio::time::timeout(Duration::from_millis(2250), recv_socket.recv_multi_from(&mut io_vec_buffers, &mut meta_scratch)).await;
 
+                    //println!("Read time: {:?}", befrecv.elapsed());
                     let Ok(result) = result else {
+                        trace!("timeout");
                         println!("timeout");
                         let phase_missing = &missing[*phase as usize];
                         send_request(&mut sendbuf,&send_socket, *phase, session_id,
-                                               phase_missing.iter(), last_retransmit_generation, loss, peer
+                                               phase_missing.iter(), last_retransmit_generation, loss, peer, None
                         ).await?;
                         loss = LinkQualitySignal::KeepGoing;
                         continue;
@@ -1659,9 +1742,13 @@ mod client {
                     for buf in 0..num_received
                     {
                         let meta = meta_scratch[buf];
-                        let msg_bytes:&[u8] = &*io_vec_buffers[buf];
+                        let msg_bytes:&[u8] = &(*io_vec_buffers[buf])[0..meta.len];
+
+                        //TODO: better naming
+                        for msg_bytes in msg_bytes.chunks(MTU_USIZE)
                         {
-                            trace!("client received {} byte message", msg_bytes.len());
+                            trace!("Received {} byte packet (batch of {})", msg_bytes.len(), num_received);
+
                             let msg = Message::msg_deserialize(Bytes::copy_from_slice(msg_bytes))?;
                             if let Some(msg_session_id) = msg.session_id() && msg_session_id != session_id {
                                 // wrong session id
@@ -1672,14 +1759,16 @@ mod client {
                                         error!("ignore request");
                                     }
                                     Message::Payload(p) => {
+                                        trace!("Received {:?} (eof: {:?})", p.index, p.eof_approaching);
                                         if p.index.phase() != *phase {
                                         } else {
 
                                             bytes_received += p.data.len() as u64 - CHECKSUM_SIZE_U64;
                                             if last_sped_print.elapsed() > Duration::from_millis(500) {
                                                 println!("Speed: {} MB/s",
-                                                    bytes_received as f64 / (1024.0 * 1024.0) / reception_start.elapsed().as_secs_f64()
+                                                    bytes_received as f64 / (1024.0 * 1024.0) / last_sped_print.elapsed().as_secs_f64()
                                                 );
+                                                bytes_received = 0;
                                                 last_sped_print = Instant::now();
                                             }
 
@@ -1730,9 +1819,11 @@ mod client {
                                                 trace!("current gap - non-missing offsets: {:?}", consecutive_non_missing_range);
                                                 assert!(consecutive_non_missing_range.start <= consecutive_non_missing_range.end);
 
+                                                let writ_time = Instant::now();
                                                 if !receiver.try_write(p.index, p.data.clone(), consecutive_non_missing_range.clone())? {
                                                     receiver.write(p.index, p.data, consecutive_non_missing_range).await?;
                                                 }
+                                                //println!("receiver write took {:?}", writ_time.elapsed());
 
 
                                                 if p.eof_approaching != PacketIdx::INVALID {
@@ -1741,14 +1832,11 @@ mod client {
                                                     assert_eq!(next_to_send.phase(), *phase); //TODO: Error handling
 
                                                     let allowed_range_start = calculate_phase_offset(next_to_send.index());
-                                                    let modified_missing =
-                                                        phase_missing.overlapping(PhaseOffset::ZERO..range.start)
-                                                            .chain(
-                                                        phase_missing.overlapping(allowed_range_start..PhaseOffset::MAX_OFFSET));
+                                                    let disallowed_range = range.start .. allowed_range_start;
 
 
                                                     send_request(&mut sendbuf, &send_socket, *phase, session_id,
-                                                                           modified_missing, last_retransmit_generation, loss.clone(), peer
+                                                                           phase_missing.iter(), last_retransmit_generation, loss.clone(), peer, Some(disallowed_range)
                                                     ).await?;
                                                     loss = LinkQualitySignal::KeepGoing;
                                                 }
@@ -1783,7 +1871,7 @@ mod client {
     impl ClientState {
         pub async fn new(config: ClientConfig) -> Result<ClientState> {
             let send_socket = tokio_socket(unicast_socket(config.bind_address)?)?;
-            let recv_socket = tokio_socket(reusable_multicast_socket(config.mcast_addr, config.bind_address)?)?;
+            let recv_socket = tokio_socket(reusable_multicast_socket(config.mcast_addr, config.bind_address, false)?)?;
 
             info!("client bound to socket");
 
@@ -2714,6 +2802,9 @@ mod util {
 
 
     impl BSocket {
+        pub fn max_send_batch(&self) -> usize {
+            self.state.max_gso_segments()
+        }
 
         pub fn send_to(&self, buf: &[u8], dst: SocketAddr) -> std::io::Result<()> {
             let transmit = Transmit {
@@ -2724,8 +2815,8 @@ mod util {
                 src_ip: None,
             };
 
-            let mut backoff = 0;
 
+            let mut backoff = 0;
             loop {
                 if let Err(err) = self.state.send((&self.socket).into(), &transmit) {
                     if err.kind() == WouldBlock {
@@ -2798,17 +2889,23 @@ mod util {
             Ok(self.socket.recv_buf_from(data).await?)
         }
 
+        pub fn match_recv_batch_size(&self) -> usize {
+            self.state.gro_segments()
+        }
+
         pub async fn recv_multi_from<'a>(&self, buf: &mut [IoSliceMut<'a>], meta_scratch: &mut Vec<RecvMeta>) -> std::io::Result<usize> {
             meta_scratch.resize(buf.len(), RecvMeta::default());
             loop {
                 let n = match self.socket.async_io(Interest::READABLE, || {
-                    self.state.recv((&self.socket).into(), buf, meta_scratch)
+                    let temp = self.state.recv((&self.socket).into(), buf, meta_scratch);
+                    temp
                 }).await {
                     Ok(n) => n,
                     // recv.readable() can lead to false positives. Try again.
                     Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e),
                 };
+
                 return Ok(n);
             }
         }
@@ -2836,10 +2933,14 @@ mod util {
 
     pub fn tokio_socket(socket: std::net::UdpSocket) -> std::io::Result<TSocket> {
         socket.set_nonblocking(true)?;
+        let mut state = UdpSocketState::new((&socket).into())?;
+        //TODO: Remove dupe code
+        state.set_recv_buffer_size((&socket).into(), 2*MTU_USIZE*state.gro_segments())?;
+        state.set_send_buffer_size((&socket).into(), 2*MTU_USIZE*state.max_gso_segments())?;
         let socket = UdpSocket::from_std(socket)?;
             Ok(
                 TSocket {
-                    state: UdpSocketState::new((&socket).into())?,
+                    state,
                     socket,
                 }
             )
@@ -2847,9 +2948,12 @@ mod util {
 
     pub fn blocking_socket(socket: std::net::UdpSocket) -> std::io::Result<BSocket> {
         socket.set_nonblocking(false)?;
+        let mut state = UdpSocketState::new((&socket).into())?;
+        state.set_recv_buffer_size((&socket).into(), 2*MTU_USIZE*state.gro_segments())?;
+        state.set_send_buffer_size((&socket).into(), 2*MTU_USIZE*state.max_gso_segments())?;
         Ok(
             BSocket {
-                state: UdpSocketState::new((&socket).into())?,
+                state,
                 socket,
             }
         )
@@ -2858,6 +2962,7 @@ mod util {
     pub fn reusable_multicast_socket(
         group: SocketAddrV4,
         iface: Ipv4Addr,
+        accept_unicast_too: bool
     ) -> std::io::Result<std::net::UdpSocket> {
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
@@ -2871,7 +2976,12 @@ mod util {
 
         // Bind to the port. Binding to INADDR_ANY (or the group addr) + reuse
         // lets several sockets share it.
-        let bind_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port()).into();
+        let bind_addr: SocketAddr = if accept_unicast_too  {
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port()).into()
+        } else {
+            SocketAddrV4::new(*group.ip(), group.port()).into()
+        };
+
         sock.bind(&bind_addr.into())?;
 
         // Join the multicast group.
