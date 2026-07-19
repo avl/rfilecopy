@@ -21,8 +21,8 @@ pub const CHECKSUM_SIZE_U64: u64 = CHECKSUM_SIZE as u64;
 
 /// How many packets prior to end of burst that clients should consider EOF
 /// approaching and make new request
-pub const PRE_REQUEST_TIME: usize = 14;
-pub const MIN_BURST_SIZE: usize = 15;
+pub const PRE_REQUEST_TIME: usize = 29;
+pub const MIN_BURST_SIZE: usize = 30;
 pub const MAX_BURST_SIZE: usize = 10000;
 
 pub const MTU: u64 = 1400;
@@ -175,6 +175,7 @@ mod messages {
     #[derive(Savefile, Clone, PartialEq, Eq, Debug)]
     pub struct Payload {
         pub session_id: SessionId,
+        pub pkt_ordinal: u8,
         pub retransmit_generation: RetransmitGeneration,
         pub phase: Phase,
         pub index: PhaseOffset,
@@ -191,7 +192,7 @@ mod messages {
         /// Size of a 0-payload `Message::Payload` message.
         ///
         /// Includes Message tag and payload size field.
-        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 2 + 2+ 8 + 8 + 8;
+        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 1 + 2 + 2+ 8 + 8 + 8;
     }
 
     #[derive(Savefile, PartialEq, Debug)]
@@ -479,7 +480,7 @@ mod disk_read_engine {
 
             let mut buf = BytesMut::new();
 
-            let mut output_idx = idx.clone();
+            //let mut output_idx = idx.clone();
 
             let task_len = tasks.len();
 
@@ -597,16 +598,16 @@ mod disk_read_engine {
                     full_chunk_size as usize
                 );
                 
-                while !buf.is_empty() && ( task_i + 1 == task_len || buf.len() >= PAYLOAD_SIZE_USIZE ) {
-                    let pktbuf =
-                        buf.split_to(PAYLOAD_SIZE_USIZE.min(buf.len())).freeze();
-                    trace!("server emitting payload: {} bytes", pktbuf.len());
+                while !buf.is_empty() && ( task_i + 1 == task_len || buf.len() >= 0xffff  ) { //TODO: Constant!
+                    //let pktbuf =
+                    //    buf.split_to(PAYLOAD_SIZE_USIZE.min(buf.len())).freeze();
+                    //trace!("server emitting payload: {} bytes", pktbuf.len());
                     /*let eof_approaching = ( output_idx.start == idx.end.saturating_sub(IndexInPhase(PRE_REQUEST_TIME as u64))).then_some(
                         idx.end
                     );
                     debug!("Sending {:?} eof {}", output_idx.start, eof_approaching.is_some());*/
 
-                    tx(pktbuf);
+                    tx(buf.split().freeze());
                     /*tx(Payload {
                         session_id,
                         retransmit_generation,
@@ -614,7 +615,7 @@ mod disk_read_engine {
                         eof_approaching: eof_approaching.unwrap_or(PacketIdx::INVALID),
                         data: pktbuf,
                     });*/
-                    output_idx.start.0 += 1;
+                    //output_idx.start.0 += 1;
                 }
 
             }
@@ -622,8 +623,8 @@ mod disk_read_engine {
             Ok(())
         }
 
-        pub async fn new(session_id: SessionId, files: FileSet) -> Self {
-            let files = Arc::new(files);
+        pub async fn new(session_id: SessionId, files: Arc<FileSet>) -> Self {
+
 
             Self {
                 files,
@@ -972,6 +973,7 @@ impl Accumulate {
             config: ServerConfig,
             mut read_engine: ReadEngine,
             socket: Arc<BSocket>,
+            fileset: Arc<FileSet>
         ) -> Result<()> {
 
 
@@ -1015,6 +1017,7 @@ impl Accumulate {
                     Present(Payload),
                     Sent
                 }
+                let mut pkt_ordinal = 0u8;
 
                 let mut scratch = BytesMut::with_capacity(2*MTU_USIZE);
                 let mut outbuf = BytesMut::with_capacity(u16::MAX as usize);
@@ -1048,6 +1051,7 @@ impl Accumulate {
                             let mut add_payload = |outbuf: &mut BytesMut, data: Bytes| -> bool {
                                 let datalen = data.len();
                                 let payload = Payload {
+                                    pkt_ordinal,
                                     session_id,
                                     retransmit_generation,
                                     phase,
@@ -1056,6 +1060,7 @@ impl Accumulate {
                                     (eof_index == emitted_packets).then_some(range.end).unwrap_or(PhaseOffset::INVALID),
                                     data,
                                 };
+                                pkt_ordinal = pkt_ordinal.wrapping_add(1);
                                 accumulator.send(payload);
 
                                 emitted_packets += 1;
@@ -1082,8 +1087,8 @@ impl Accumulate {
                                 };
                                 //println!("Background job received {} bytes", fragment.len());
                                 if !scratch.is_empty() {
-                                    assert!(fragment.len() < PAYLOAD_SIZE_USIZE); //TODO: remove
-                                    let scratch_missing = fragment.len() - PAYLOAD_SIZE_USIZE;
+                                    assert!(scratch.len() < PAYLOAD_SIZE_USIZE); //TODO: remove
+                                    let scratch_missing = PAYLOAD_SIZE_USIZE - scratch.len();
                                     let take = scratch_missing.min(fragment.len());
                                     scratch.extend_from_slice(&fragment[..take]);
                                     fragment.advance(take);
@@ -1095,7 +1100,8 @@ impl Accumulate {
                                         break;
                                     }
                                     scratch.clear();
-                                } else if scratch.is_empty() {
+                                }
+                                if scratch.is_empty() {
 
                                     while fragment.len() >= PAYLOAD_SIZE_USIZE {
                                         let send = fragment.split_to(PAYLOAD_SIZE_USIZE);
@@ -1115,7 +1121,6 @@ impl Accumulate {
 
             std::thread::spawn(move||{
 
-
                 //let mut prefetched_range: LruCache<PacketIdx, Payload> = LruCache::new(NonZeroUsize::new(1000).unwrap());
                 loop {
 
@@ -1132,6 +1137,7 @@ impl Accumulate {
                     let (tx,rx) = flume::bounded(1000); //TODO: Constant
 
                     _ = socket_send_tx.send(SendEvent::Prepare(generation, phase, pkts.clone(), rx));
+
 
                     let result = read_engine
                         .get_packets(phase, generation, session_id, pkts, |pkt| {
@@ -1170,6 +1176,7 @@ impl Accumulate {
             info!("Full Fileset: {:#?}", files);
 
             let meta = files.calculate_meta_and_assign_fileset_buf()?;
+            let files = Arc::new(files);
             let mut state = ServerState {
                 config,
                 logic_state: ServerLogicState {
@@ -1194,10 +1201,10 @@ impl Accumulate {
             };
 
 
-            let re = ReadEngine::new(state.session_id, files).await;
+            let re = ReadEngine::new(state.session_id, files.clone()).await;
 
             info!("starting file fetching worker");
-            Self::file_fetching_worker(rx, session_id, state.config.clone(), re, unicast_socket).await?;
+            Self::file_fetching_worker(rx, session_id, state.config.clone(), re, unicast_socket, files.clone()).await?;
 
 
             /*spawn(async move{
@@ -1688,7 +1695,7 @@ mod client {
 
 
 
-
+                let mut prev_pkt_ordinal : Option<u8> = None;
 
                 'phaseloop: loop {
 
@@ -1789,7 +1796,7 @@ mod client {
 
                                             trace!("client received payload for range {:?} (data len {})", range, p.data.len());
                                             let phase_missing = &mut missing[phase.0 as usize];
-                                            let holes_before = phase_missing.len();
+
 
                                             //TODO: Implement leadership support for client too
 
@@ -1798,18 +1805,21 @@ mod client {
                                                 trace!("received packet was useful");;
 
                                                 phase_missing.remove(range.clone());
-                                                let holes_after = phase_missing.len();
-                                                if holes_after > holes_before {
-                                                    println!("Loss detected: {:?}", phase_missing);
-                                                    loss = LinkQualitySignal::LossDetected;
-                                                    no_loss_counter = 0;
-                                                } else {
-                                                    no_loss_counter += 1;
-                                                    if no_loss_counter > 100 && loss == LinkQualitySignal::KeepGoing {
-                                                        loss = LinkQualitySignal::IncreaseWindow;
+
+                                                if let Some(prev_pkt_ordinal) = prev_pkt_ordinal {
+                                                    if prev_pkt_ordinal.wrapping_add(1) != p.pkt_ordinal {
+                                                        println!("Loss detected: {:?}", phase_missing);
+                                                        loss = LinkQualitySignal::LossDetected;
                                                         no_loss_counter = 0;
+                                                    } else {
+                                                        no_loss_counter += 1;
+                                                        if no_loss_counter > 100 && loss == LinkQualitySignal::KeepGoing {
+                                                            loss = LinkQualitySignal::IncreaseWindow;
+                                                            no_loss_counter = 0;
+                                                        }
                                                     }
                                                 }
+                                                prev_pkt_ordinal = Some(p.pkt_ordinal);
 
                                                 let missing_range_end = phase_missing.overlapping(range.end..PhaseOffset::MAX).next().cloned();
                                                 let missing_range_start = phase_missing.overlapping(PhaseOffset::ZERO..range.start).rev().next().cloned();
