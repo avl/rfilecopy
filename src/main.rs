@@ -1319,6 +1319,7 @@ mod client {
     use std::path::PathBuf;
     use std::pin::pin;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use arrayvec::ArrayVec;
     use bytes::{Buf, Bytes, BytesMut};
@@ -1412,7 +1413,7 @@ mod client {
 
     /// TODO: Activate all workers again, just make sure one worker doesn't report
     /// file complete while it's written by others
-    pub const WRITE_WORKERS: usize = 1;
+    pub const WRITE_WORKERS: usize = 4;
 
     impl FileSetDiskWriter {
         pub async fn new(
@@ -1531,7 +1532,13 @@ mod client {
                                     curfile_ref.file.seek(SeekFrom::Start(need.file_offset))?;
                                     curfile_ref.file.write_all(&bytes_now)?;
 
+                                    let written_now = need.written_complete.fetch_add(bytes_now.len() as u64, Ordering::Relaxed) + bytes_now.len() as u64;
+
                                     if contains(completed_range.clone(), need.file_range.clone()) {
+
+                                        while need.written_complete.load(Ordering::Relaxed) != need.file_size {
+                                            std::thread::sleep(std::time::Duration::from_millis(1));
+                                        }
                                         let mut f = curfile.take().unwrap();
                                         //TODO: Make sure empty directories are created.
                                         // Could do as a pass when receiving bytes before empty dir in sequence
@@ -1544,6 +1551,7 @@ mod client {
                                         );
                                         trace!("detected that file {} was complete, because completed range is {:?} and file range is {:?}", need.path.display(), completed_range, need.file_range);
                                         hasher_tx.send_async((need.checksum.clone(), need.path.to_path_buf())).await.expect("hashers do not die");
+
                                     }
 
                                     cur_phase_offset.0 += bytes_now_progress as u64;
@@ -2071,7 +2079,7 @@ mod file_set {
     use std::ops::{Range, RangeInclusive};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use bytes::{BufMut, BytesMut};
     use savefile::prelude::Savefile;
     use savefile::Serializer;
@@ -2156,7 +2164,11 @@ mod file_set {
         has_checksum: AtomicBool,
         #[savefile_ignore]
         #[savefile_introspect_ignore]
-        checksum: AtomicChecksum
+        checksum: AtomicChecksum,
+        #[savefile_ignore]
+        #[savefile_introspect_ignore]
+        written_complete: AtomicU64
+
     }
 
     impl Add<u64> for PhaseOffset {
@@ -2332,6 +2344,7 @@ mod file_set {
         // Size *including* checksum
         pub file_size: u64,
         pub checksum: &'a AtomicChecksum,
+        pub written_complete: &'a AtomicU64,
         /// PhaseOffset range occupied by complete file (including checksum)
         pub file_range: Range<PhaseOffset>,
     }
@@ -2389,6 +2402,7 @@ mod file_set {
                             file_offset,
                             file_size: f.size,
                             checksum: &f.checksum,
+                            written_complete: &f.written_complete,
                             file_range: f.offset .. f.offset + f.size,
                         });
                     }
@@ -2748,6 +2762,7 @@ mod file_set {
                 },
                 has_checksum: Default::default(),
                 checksum: Default::default(),
+                written_complete: Default::default(),
             }))
         }
     }
