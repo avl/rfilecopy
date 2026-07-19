@@ -714,7 +714,7 @@ mod server {
     use crate::messages::{Announce, LinkQualitySignal, Message, Payload, Request};
     use crate::{overlaps, RetransmitGeneration, SessionId, DEFAULT_BIND_ADDRESS, MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, DEFAULT_MCAST_ADDR, PhaseOffset, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE, PRE_REQUEST_TIME, Phase};    use anyhow::{Result, bail};
     use bytes::{Buf, Bytes, BytesMut};
-    use flume::Receiver;
+    use flume::{unbounded, Receiver, Sender};
     use lru::LruCache;
     use rangemap::RangeMap;
     use savefile::Serialize;
@@ -722,7 +722,7 @@ mod server {
     use tokio::{select, spawn};
     use tracing::{debug, error, info, trace, warn};
     use crate::util::{reusable_multicast_socket, unicast_socket, TSocket, BSocket, blocking_socket, tokio_socket};
-    const FILE_READING_WORKERS: usize = 4;
+    const FILE_READING_WORKERS: usize = 16;
 
     #[derive(Clone, Debug)]
     pub struct ServerConfig {
@@ -849,7 +849,7 @@ mod server {
                 trace!("Retransmit gen mismatch, {} vs {}",  r.retransmit_generation.0, self.current_retransmit_generation.0 );
                 //TODO: Constants
                 if self.time_when_last_out_of_date_retransmit_gen_accepted.elapsed() > Duration::from_secs(1) {
-                    trace!("Retransmit gen mismatch timer elapsed");
+                    warn!("Retransmit gen mismatch timer elapsed");
                     self.time_when_last_out_of_date_retransmit_gen_accepted = Instant::now();
                 }
                 else {
@@ -929,14 +929,17 @@ impl Accumulate {
         msg.msg_serialize(&mut self.send_buf);
         let packet_size = self.send_buf.len() - size_before;
 
+        //println!("Accum {} bytes (tot: {})", packet_size, self.send_buf.len());
         if !self.send_buf.is_empty() && (packet_size != MTU_USIZE || self.send_buf.len() + MTU_USIZE > self.max_buf_size_bytes) {
             trace!("Sending {} packets, rem: {}", self.send_buf.len().div_ceil(MTU_USIZE), self.send_buf.len()%MTU_USIZE);
+            //println!("Sending {} packets, rem: {}", self.send_buf.len().div_ceil(MTU_USIZE), self.send_buf.len()%MTU_USIZE);
             self.flush()
         }
     }
     pub fn flush(&mut self) {
         if !self.send_buf.is_empty() {
             trace!("Sending {} final packets to {:?}", self.send_buf.len().div_ceil(MTU_USIZE), SocketAddr::V4(self.config.mcast_addr));
+            //println!("Sending {} final packets to {:?}", self.send_buf.len().div_ceil(MTU_USIZE), SocketAddr::V4(self.config.mcast_addr));
             if let Err(err) = self.socket
                 .send_to(&self.send_buf, SocketAddr::V4(self.config.mcast_addr)) {
                 error!("Failed to send {} byte buffer: {:?}", self.send_buf.len(), err);
@@ -987,21 +990,13 @@ impl Accumulate {
             let max_buf_size_bytes = (socket.max_send_batch() * MTU_USIZE).min(MAX_GSO_BYTES);
             debug!("Max buf size: {}", max_buf_size_bytes);
 
-            let mut socket_send_txs = vec![];
-            let mut socket_send_rxs = vec![];
 
-            let (socket_send_tx, socket_send_rx) = flume::bounded::<SendEvent>(1000);
+            let (socket_send_tx, socket_send_rx) = flume::unbounded::<SendEvent>();
 
-            //TODO: Hardcode
-            for _ in 0..FILE_READING_WORKERS {
-                let (socket_send_tx, socket_send_rx) = flume::bounded::<SendEvent>(1000);
-                socket_send_txs.push(socket_send_tx);
-                socket_send_rxs.push(socket_send_rx);
-            }
-            // TODO: Introduce constant
 
             enum SendEvent {
                 Prepare(RetransmitGeneration, Phase, Range<PhaseOffset>, Receiver<Bytes>, bool/*last*/),
+                Flush,
             }
 
             std::thread::spawn(move||{
@@ -1025,7 +1020,7 @@ impl Accumulate {
                 loop {
                     let pre_recv_work = Instant::now();
 
-                    println!("BAckground worker waiting for new order");
+                    //println!("BAckground worker waiting for new order");
                     let Ok(ev) = socket_send_rx.recv() else {
                         info!("exiting socket send thread");
                         return;
@@ -1036,9 +1031,12 @@ impl Accumulate {
                     }
 
                     match ev {
+                        SendEvent::Flush=> {
+                            accumulator.flush();
+                        }
                         SendEvent::Prepare(retransmit_generation, phase, mut range, sub_receiver, last) => {
 
-                            println!("Background sender received {range:?}");
+                            //println!("Background sender received {range:?}");
                             if range.is_empty() {
                                 error!("internal error - total size was 0");
                                 continue;
@@ -1047,9 +1045,10 @@ impl Accumulate {
                             let mut output_idx = range.start;
 
                             let mut emitted_packets = 0;
-                            let eof_index = (range.end-range.start).div_ceil(MTU) - (PRE_REQUEST_TIME as u64);
+                            let eof_index = (range.end.0-range.start.0).div_ceil(MTU)/2;
 
-                            let mut add_payload = |outbuf: &mut BytesMut, data: Bytes| -> bool {
+                            // Returns bytes remaining
+                            let mut add_payload = |outbuf: &mut BytesMut, data: Bytes| {
                                 let datalen = data.len();
                                 let payload = Payload {
                                     pkt_ordinal,
@@ -1067,18 +1066,15 @@ impl Accumulate {
                                 emitted_packets += 1;
                                 output_idx = output_idx + datalen as u64;
                                 //println!("output_idx now:{:?}, range.end = {:?}", output_idx, range.end);
-                                if output_idx == range.end {
-                                    accumulator.flush();
-                                    true
-                                } else {
-                                    false
-                                }
                             };
+                            let mut remaining_bytes = range.end - range.start;
 
                             scratch.clear();
                             loop {
+                                let pre_sub = Instant::now();
+                                //println!("Calling sub_receiver");
                                 let Ok(mut fragment) = sub_receiver.recv() else {
-                                    info!("sub_receiver exited");
+                                    panic!("sub_receiver exited");
                                     //println!("sub_receiver exited");
                                     if !scratch.is_empty() {
                                         _ = add_payload(&mut outbuf, scratch.split().freeze());
@@ -1086,31 +1082,44 @@ impl Accumulate {
                                     }
                                     break;
                                 };
+                                //println!("Server fragment {:?}", fragment.len());
+                                let sub_recv_time = pre_sub.elapsed();
+                                if sub_recv_time > Duration::from_nanos(10000) {
+                                    println!("Slow sub receiver: {:?}", sub_recv_time);
+                                }
                                 //println!("Background job received {} bytes", fragment.len());
+                                let next_chunk_size = remaining_bytes.min(PAYLOAD_SIZE);
                                 if !scratch.is_empty() {
-                                    assert!(scratch.len() < PAYLOAD_SIZE_USIZE); //TODO: remove
-                                    let scratch_missing = PAYLOAD_SIZE_USIZE - scratch.len();
+                                    assert!((scratch.len() as u64) < next_chunk_size); //TODO: remove
+                                    let scratch_missing = next_chunk_size as usize - scratch.len();
                                     let take = scratch_missing.min(fragment.len());
                                     scratch.extend_from_slice(&fragment[..take]);
                                     fragment.advance(take);
                                 }
-                                assert!(scratch.len() <= PAYLOAD_SIZE_USIZE);
-
-                                if scratch.len() == PAYLOAD_SIZE_USIZE {
-                                    if add_payload(&mut outbuf, scratch.split().freeze()) {
-                                        break;
-                                    }
+                                assert!(scratch.len() as u64 <= next_chunk_size); //TODO: Check we don't cast u64 to usize anywhere! (this place is fine now, check others)
+                                if scratch.len() as u64 == next_chunk_size {
+                                    remaining_bytes -= scratch.len() as u64;
+                                    //println!("add_payload next_chunk_size: {}", next_chunk_size);
+                                    add_payload(&mut outbuf, scratch.split().freeze());
                                     scratch.clear();
                                 }
                                 if scratch.is_empty() {
-
-                                    while fragment.len() >= PAYLOAD_SIZE_USIZE {
-                                        let send = fragment.split_to(PAYLOAD_SIZE_USIZE);
-                                        if add_payload(&mut outbuf, send) {
+                                    loop {
+                                        let next_chunk_size = remaining_bytes.min(PAYLOAD_SIZE) as usize;
+                                        if fragment.len() < next_chunk_size || next_chunk_size == 0 {
                                             break;
                                         }
+                                        let send = fragment.split_to(next_chunk_size);
+                                        remaining_bytes -= send.len() as u64;
+                                        //println!("add_payload next_chunk_size: {}", next_chunk_size );
+                                        add_payload(&mut outbuf, send);
                                     }
                                     scratch.extend_from_slice(&fragment);
+                                } else {
+                                    assert_eq!(fragment.len(), 0);
+                                }
+                                if remaining_bytes == 0 {
+                                    break;
                                 }
                             }
                         }
@@ -1119,9 +1128,28 @@ impl Accumulate {
             });
 
 
-            let mut read_engines = vec![];
-            for _ in 0..4 {
-                read_engines.push(read_engine.clone());
+            let mut channel_txs = vec![];
+
+            for chn in 0..FILE_READING_WORKERS {
+                let (tx,rx) = flume::unbounded::<(Phase, RetransmitGeneration, Range<PhaseOffset>, Sender<_>)>();
+                let mut read_engine = read_engine.clone();
+                std::thread::spawn(move||{
+                    loop {
+                        let Ok((phase, generation, rng, tx)) = rx.recv() else {
+                            println!("Background thread exiting!");
+                            return;
+                        };
+                        let result = read_engine
+                            .get_packets(phase, generation, session_id, rng, |pkt| {
+                                _ = tx.send(pkt);
+                            });
+                        if let Err(err) = result {
+                            // TODO: error handling
+                            panic!("disk access failed {:?}", err);
+                        }
+                    }
+                });
+                channel_txs.push(tx);
             }
 
             std::thread::spawn(move||{
@@ -1136,36 +1164,30 @@ impl Accumulate {
 
 
                     trace!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
-                    println!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
+                    //println!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
                     let bef_gp = Instant::now();
 
 
                     let split_ranges: Vec<Range<PhaseOffset>> = fileset.split_at_file_boundaries(phase, pkts.clone());
 
-                    println!("Split {:?} into {:?}", pkts, split_ranges);
+                    //println!("Split {:?} into {:?}", pkts, split_ranges);
 
-                    let mut txs = vec![];
+                    //let mut txs = vec![];
                     for (idx,splitrng) in split_ranges.iter().enumerate() {
-                        let (tx,rx) = flume::bounded(1000); //TODO: Constant
+                        let (tx,rx) = flume::unbounded(); //TODO: Constant
 
                         //TODO: This whole 'prepare'-mechanism is overly complicated and was created
                         // when we thought we'd be threading 'get_packets'
                         _ = socket_send_tx.send(SendEvent::Prepare(generation, phase, splitrng.clone(), rx, idx +1 == split_ranges.len()));
-                        txs.push(tx);
+
+                        let channel = if idx +1 == split_ranges.len() {0} else {idx %FILE_READING_WORKERS};
+
+                        channel_txs[channel].send(
+                            (phase, generation, splitrng.clone(), tx                        ));
                     }
 
+                    _ = socket_send_tx.send(SendEvent::Flush);
 
-                    for (i, rng) in split_ranges.into_iter().enumerate() {
-                        let channel = i%4;
-                        let result = read_engines[channel]
-                            .get_packets(phase, generation, session_id, rng, |pkt| {
-                                _ = txs[i].send(pkt);
-                            });
-                        if let Err(err) = result {
-                            // TODO: error handling
-                            panic!("disk access failed {:?}", err);
-                        }
-                    }
 
                     let bef_el = bef_gp.elapsed();
                     //println!("get_packets took: {:?} send took {:?}, get itself {:?}", bef_el, send_took, bef_el - send_took);
@@ -1267,9 +1289,9 @@ impl Accumulate {
                 debug!("Server calling socket.recv_from");
                 buf.clear();
                 buf.reserve(MTU_USIZE);
-                println!("Server calling socket.recv_from");
+                //println!("Server calling socket.recv_from");
                 let (size, src) = state.multicast_socket.recv_single_from(&mut buf).await?;
-                println!("server received {}/{} main request packet", size, buf.len());
+                //println!("server received {}/{} main request packet", size, buf.len());
 
                 assert_eq!(size, buf.len());
                 match state
@@ -1791,7 +1813,7 @@ mod client {
                                         if p.phase != *phase {
                                         } else {
 
-                                            bytes_received += p.data.len() as u64 - CHECKSUM_SIZE_U64;
+                                            bytes_received += (p.data.len() as u64).saturating_sub(CHECKSUM_SIZE_U64);
                                             if last_sped_print.elapsed() > Duration::from_millis(500) {
                                                 println!("Speed: {} MB/s",
                                                     bytes_received as f64 / (1024.0 * 1024.0) / last_sped_print.elapsed().as_secs_f64()
@@ -2042,7 +2064,7 @@ mod client {
 mod file_set {
     use std::borrow::Borrow;
     use crate::file_set::Entry::File;
-    use crate::{overlaps, PhaseOffset, PhaseSize, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, Phase};
+    use crate::{overlaps, PhaseOffset, PhaseSize, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, Phase, PRE_REQUEST_TIME};
     use anyhow::{Error, Result, anyhow, bail};
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
     use rayon::prelude::IntoParallelIterator;
@@ -2248,15 +2270,21 @@ mod file_set {
 
             let mut ret = vec![];
             while !rng.is_empty() {
-                let boundary = cursor.seek_next_file_boundary();
+                let Some(boundary) = cursor.seek_next_file_boundary() else {
+                    ret.push(rng);
+                    break;
+                };
                 assert_ne!(boundary, rng.start);
                 if boundary > rng.end {
                     ret.push(rng);
                     break;
                 } else {
                     assert!(boundary > rng.start);
-                    ret.push(rng.start..boundary);
-                    rng = boundary .. rng.end;
+                    // Don't split into too small chunks
+                    if boundary.0 - rng.start.0 > PRE_REQUEST_TIME as u64 + 1 {
+                        ret.push(rng.start..boundary);
+                        rng = boundary .. rng.end;
+                    }
                 }
             }
 
@@ -2293,10 +2321,10 @@ mod file_set {
 
     impl<'a> FileSetCursor<'a> {
 
-        pub fn seek_next_file_boundary(&mut self) -> PhaseOffset {
+        pub fn seek_next_file_boundary(&mut self) -> Option<PhaseOffset> {
             let next = self.stack.last().unwrap().last_offset_exclusive();
-            _ = self.seek(self.cur_phase, next).unwrap();
-            next
+            _ = self.seek(self.cur_phase, next).ok()?;
+            Some(next)
         }
     }
 
@@ -2368,7 +2396,8 @@ mod file_set {
                         });
                     }
                     Entry::Directory(d) => {
-                        let entry = d.entry_for(packet_offset).expect("we know entry contains range");
+                        assert!(packet_offset >= d.offset);
+                        let entry = d.entry_for(packet_offset).ok_or_else(||anyhow!("offset is not in tree"))?;
                         debug!("Pushing name {:?}, seek: {:?}.{:?}, parent start: {:?} sub item range: {:?}", entry.name(), packet_phase, packet_offset,
                                 d.offset,
                                  entry.first_offset()..entry.last_offset_exclusive());
