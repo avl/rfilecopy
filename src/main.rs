@@ -1006,13 +1006,7 @@ impl Accumulate {
                     send_buf: BytesMut::with_capacity(max_buf_size_bytes),
                     config,
                 };
-                //let mut cur_range = PacketIdx::INVALID .. PacketIdx::INVALID;
-                #[derive(Clone)]
-                enum PayloadBucket {
-                    Awaiting,
-                    Present(Payload),
-                    Sent
-                }
+
                 let mut pkt_ordinal = 0u8;
 
                 let mut scratch = BytesMut::with_capacity(2*MTU_USIZE);
@@ -1163,6 +1157,7 @@ impl Accumulate {
                     };
 
 
+
                     trace!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
                     //println!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
                     let bef_gp = Instant::now();
@@ -1182,15 +1177,17 @@ impl Accumulate {
 
                         let channel = if idx +1 == split_ranges.len() {0} else {idx %FILE_READING_WORKERS};
 
-                        channel_txs[channel].send(
-                            (phase, generation, splitrng.clone(), tx                        ));
+                        _ = channel_txs[channel].send(
+                            (phase, generation, splitrng.clone(), tx
+                        ));
+
                     }
 
                     _ = socket_send_tx.send(SendEvent::Flush);
 
 
                     let bef_el = bef_gp.elapsed();
-                    //println!("get_packets took: {:?} send took {:?}, get itself {:?}", bef_el, send_took, bef_el - send_took);
+                    println!("get_packets took: {:?}", bef_el);
 
 
 
@@ -1410,7 +1407,7 @@ mod client {
         }
     }
 
-    pub const WRITE_BUFFER_SIZE_PACKETS: usize = 100;
+    pub const WRITE_BUFFER_SIZE_PACKETS: usize = 1000;
     pub const HASHER_BUFFER_SIZE_PACKETS: usize = 100;
 
     /// TODO: Activate all workers again, just make sure one worker doesn't report
@@ -1887,7 +1884,7 @@ mod client {
                                                     let allowed_range_start = next_to_send;
                                                     let disallowed_range = range.start .. allowed_range_start;
 
-
+                                                    println!("EOF APPROACHING: {:?} (retran:{:?}, last retran: {:?})", p.eof_approaching, p.retransmit_generation, last_retransmit_generation);
                                                     send_request(&mut sendbuf, &send_socket, *phase, session_id,
                                                                            phase_missing.iter(), last_retransmit_generation, loss.clone(), peer, Some(disallowed_range)
                                                     ).await?;
@@ -2035,8 +2032,8 @@ mod client {
 
                         self.state = ClientStateEnum::Receiving {
                             fileset: writer,
-                            session_id: session_id,
-                            server: server,
+                            session_id,
+                            server,
                             phases,
                         };
                     }
