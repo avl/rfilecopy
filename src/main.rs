@@ -333,7 +333,7 @@ mod disk_read_engine {
         response: flume::Sender<Buf>,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum ChecksummingState {
         Hashing { hasher: blake3::Hasher, offset: u64, hashed_bytes: Vec<u8> },
         Finished([u8; CHECKSUM_SIZE], Vec<u8>),
@@ -349,6 +349,7 @@ mod disk_read_engine {
         }
     }
 
+    #[derive(Clone)]
     pub struct ReadEngine {
         files: Arc<FileSet>,
         //TODO: GC?
@@ -1000,7 +1001,7 @@ impl Accumulate {
             // TODO: Introduce constant
 
             enum SendEvent {
-                Prepare(RetransmitGeneration, Phase, Range<PhaseOffset>, Receiver<Bytes>),
+                Prepare(RetransmitGeneration, Phase, Range<PhaseOffset>, Receiver<Bytes>, bool/*last*/),
             }
 
             std::thread::spawn(move||{
@@ -1035,7 +1036,7 @@ impl Accumulate {
                     }
 
                     match ev {
-                        SendEvent::Prepare(retransmit_generation, phase, mut range, sub_receiver) => {
+                        SendEvent::Prepare(retransmit_generation, phase, mut range, sub_receiver, last) => {
 
                             println!("Background sender received {range:?}");
                             if range.is_empty() {
@@ -1057,7 +1058,7 @@ impl Accumulate {
                                     phase,
                                     index: output_idx,
                                     eof_approaching:
-                                    (eof_index == emitted_packets).then_some(range.end).unwrap_or(PhaseOffset::INVALID),
+                                      (last && eof_index == emitted_packets).then_some(range.end).unwrap_or(PhaseOffset::INVALID),
                                     data,
                                 };
                                 pkt_ordinal = pkt_ordinal.wrapping_add(1);
@@ -1118,6 +1119,10 @@ impl Accumulate {
             });
 
 
+            let mut read_engines = vec![];
+            for _ in 0..4 {
+                read_engines.push(read_engine.clone());
+            }
 
             std::thread::spawn(move||{
 
@@ -1134,15 +1139,33 @@ impl Accumulate {
                     println!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
                     let bef_gp = Instant::now();
 
-                    let (tx,rx) = flume::bounded(1000); //TODO: Constant
 
-                    _ = socket_send_tx.send(SendEvent::Prepare(generation, phase, pkts.clone(), rx));
+                    let split_ranges: Vec<Range<PhaseOffset>> = fileset.split_at_file_boundaries(phase, pkts.clone());
+
+                    println!("Split {:?} into {:?}", pkts, split_ranges);
+
+                    let mut txs = vec![];
+                    for (idx,splitrng) in split_ranges.iter().enumerate() {
+                        let (tx,rx) = flume::bounded(1000); //TODO: Constant
+
+                        //TODO: This whole 'prepare'-mechanism is overly complicated and was created
+                        // when we thought we'd be threading 'get_packets'
+                        _ = socket_send_tx.send(SendEvent::Prepare(generation, phase, splitrng.clone(), rx, idx +1 == split_ranges.len()));
+                        txs.push(tx);
+                    }
 
 
-                    let result = read_engine
-                        .get_packets(phase, generation, session_id, pkts, |pkt| {
-                            _ = tx.send(pkt);
-                        });
+                    for (i, rng) in split_ranges.into_iter().enumerate() {
+                        let channel = i%4;
+                        let result = read_engines[channel]
+                            .get_packets(phase, generation, session_id, rng, |pkt| {
+                                _ = txs[i].send(pkt);
+                            });
+                        if let Err(err) = result {
+                            // TODO: error handling
+                            panic!("disk access failed {:?}", err);
+                        }
+                    }
 
                     let bef_el = bef_gp.elapsed();
                     //println!("get_packets took: {:?} send took {:?}, get itself {:?}", bef_el, send_took, bef_el - send_took);
@@ -1150,9 +1173,6 @@ impl Accumulate {
 
 
                     trace!("file fetching worker done");
-                    if let Err(err) = result {
-                        error!("disk access failed {:?}", err);
-                    }
                 }
             });
 
@@ -2219,6 +2239,29 @@ mod file_set {
             }
             Ok(())
         }
+        pub fn split_at_file_boundaries(&self, phase: Phase, mut rng: Range<PhaseOffset>) -> Vec<Range<PhaseOffset>> {
+            if phase.0 == 0 {
+                return vec![rng];
+            }
+            let mut cursor = self.make_cursor();
+            cursor.seek(phase, rng.start).unwrap(); //TODO: error handling
+
+            let mut ret = vec![];
+            while !rng.is_empty() {
+                let boundary = cursor.seek_next_file_boundary();
+                assert_ne!(boundary, rng.start);
+                if boundary > rng.end {
+                    ret.push(rng);
+                    break;
+                } else {
+                    assert!(boundary > rng.start);
+                    ret.push(rng.start..boundary);
+                    rng = boundary .. rng.end;
+                }
+            }
+
+            ret
+        }
     }
 
     pub struct Meta {
@@ -2246,6 +2289,15 @@ mod file_set {
         cur_phase: Phase,
         stack: Vec<&'a Entry>,
         path: PathBuf,
+    }
+
+    impl<'a> FileSetCursor<'a> {
+
+        pub fn seek_next_file_boundary(&mut self) -> PhaseOffset {
+            let next = self.stack.last().unwrap().last_offset_exclusive();
+            _ = self.seek(self.cur_phase, next).unwrap();
+            next
+        }
     }
 
     #[derive(Debug)]
@@ -2306,6 +2358,7 @@ mod file_set {
                     File(f) => {
                         let file_offset = packet_offset.0 - f.offset.0;
                         debug_assert!(file_offset < f.size);
+                        assert!(f.size > 0); // TODO: zero sized files can't be naturally supported. We need to add a post-process step to create 0-sized files and directories
                         return Ok(WriteNeed {
                             path: &self.path,
                             file_offset,
