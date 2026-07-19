@@ -60,57 +60,17 @@ impl RetransmitGeneration {
     }
 }
 
-/// Phases are always split on packet boundaries.
-///
-/// This means all packets can be identified by a
-/// phase + index. The size of the last packet (only) can differ
-/// from MTU.
-#[derive(Savefile, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PacketIdx(u64);
 
-impl PacketIdx {
 
-    // TODO: Fail construction of invalid values through other means
-    pub const INVALID: PacketIdx = PacketIdx(u64::MAX);
 
-    pub(crate) fn saturating_sub(&self, index: IndexInPhase) -> PacketIdx {
-        let new_index = self.index().0.saturating_sub(index.0);
-
-        PacketIdx::new(self.phase(), IndexInPhase(new_index))
-    }
-}
-
-impl Debug for PacketIdx {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "#{}.{}",
-            self.0>>48,
-            self.0&0xffff_ffff_ffff
-        )
-    }
-}
-
-/// The index of a packet within a specific phase.
 #[derive(Savefile, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct IndexInPhase(pub u64);
+pub struct Phase(pub u16);
 
 /// Offset within a phase, in bytes
 #[derive(Savefile, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PhaseOffset(pub u64);
 
-impl PhaseOffset {
-    pub const MAX_OFFSET: PhaseOffset = PhaseOffset(IndexInPhase::MAX_INDEX.0*PAYLOAD_SIZE);
-    pub(crate) fn floor_index(&self) -> IndexInPhase {
-        IndexInPhase(self.0 / PAYLOAD_SIZE)
-    }
-    pub(crate) fn ceil_index(&self) -> IndexInPhase {
-        IndexInPhase(self.0.div_ceil(PAYLOAD_SIZE))
-    }
-}
 
-impl IndexInPhase {
-    pub const ZERO: IndexInPhase = IndexInPhase(0);
-    pub const MAX_INDEX: IndexInPhase = IndexInPhase(0xffff_ffff_ffff);
-}
 
 trait PhaseSize {
     fn max_offset_exclusive(&self, phase: u16) -> Option<PhaseOffset>;
@@ -130,28 +90,15 @@ pub fn contains<T: Ord>(a: Range<T>, b: Range<T>) -> bool {
     a.start <= b.start && a.end >= b.end
 }
 
-pub fn calculate_phase_offset(index_in_phase: IndexInPhase) -> PhaseOffset {
-    PhaseOffset(index_in_phase.0 * PAYLOAD_SIZE)
-}
-
-pub fn byte_range(index_in_phase: Range<IndexInPhase>) -> Range<PhaseOffset> {
-    (PhaseOffset(index_in_phase.start.0 * PAYLOAD_SIZE)
-        ..PhaseOffset((index_in_phase.end.0) * PAYLOAD_SIZE))
-        .into()
-}
 
 impl PhaseOffset {
+    pub const INVALID: PhaseOffset = PhaseOffset(u64::MAX);
+    pub const MAX: PhaseOffset = PhaseOffset(u64::MAX-1);
     pub const ZERO: PhaseOffset = PhaseOffset(0);
 
 }
-
+/*
 impl PacketIdx {
-    pub fn deserialize(mut data: &mut Bytes) -> Result<PacketIdx> {
-        Ok(PacketIdx(data.try_get_u64()?))
-    }
-    pub fn serialize(&self, mut data: &mut BytesMut) {
-        data.put_u64(self.0);
-    }
 
     pub fn new(phase: u16, index: IndexInPhase) -> Self {
         if index > IndexInPhase::MAX_INDEX {
@@ -194,9 +141,9 @@ impl PacketIdx {
         })
     }
 }
-
+*/
 mod messages {
-    use crate::{PacketIdx, PhaseOffset, RetransmitGeneration, SessionId, MTU_USIZE, IndexInPhase};
+    use crate::{PhaseOffset, RetransmitGeneration, SessionId, MTU_USIZE, Phase};
     use anyhow::{Result, bail};
     use arrayvec::ArrayVec;
     use savefile::prelude::Savefile;
@@ -218,24 +165,25 @@ mod messages {
     #[derive(Savefile, PartialEq, Debug)]
     pub struct Request {
         pub session_id: SessionId,
-        pub phase: u16,
+        pub phase: Phase,
         pub retransmit_generation: RetransmitGeneration,
         /// Client did not receiver everything it wanted.
         pub loss: LinkQualitySignal,
-        pub sections: ArrayVec<Range<IndexInPhase>, MAX_SECTIONS_PER_REQUEST>,
+        pub sections: ArrayVec<Range<PhaseOffset>, MAX_SECTIONS_PER_REQUEST>,
     }
 
     #[derive(Savefile, Clone, PartialEq, Eq, Debug)]
     pub struct Payload {
         pub session_id: SessionId,
         pub retransmit_generation: RetransmitGeneration,
-        pub index: PacketIdx,
+        pub phase: Phase,
+        pub index: PhaseOffset,
         /// We're approaching the end of the batch, clients
         /// are encouraged to make new requests (with retransmit_generation + 1)
         ///
         /// The new request should start at the given packedidx, to avoid retransmitting
         /// already queued stuff.
-        pub eof_approaching: PacketIdx,
+        pub eof_approaching: PhaseOffset,
         pub data: Bytes,
     }
 
@@ -243,7 +191,7 @@ mod messages {
         /// Size of a 0-payload `Message::Payload` message.
         ///
         /// Includes Message tag and payload size field.
-        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 2 + 8 + 8 + 8;
+        pub const PAYLOAD_HEADER_SIZE: u64 = 1 + 4 + 2 + 2+ 8 + 8 + 8;
     }
 
     #[derive(Savefile, PartialEq, Debug)]
@@ -332,7 +280,7 @@ mod messages {
 mod disk_read_engine {
     use crate::file_set::{FileSet, Kind, OwnedSource, OwnedSourceId, Source};
     use crate::messages::Payload;
-    use crate::{calculate_phase_offset, messages, IndexInPhase, PacketIdx, PhaseOffset, PhaseSize, RetransmitGeneration, SessionId, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE, PAYLOAD_SIZE_USIZE_WITHOUT_HASH, PRE_REQUEST_TIME};
+    use crate::{messages, PhaseOffset, PhaseSize, RetransmitGeneration, SessionId, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE, PAYLOAD_SIZE_USIZE_WITHOUT_HASH, PRE_REQUEST_TIME, Phase};
     use anyhow::{anyhow, bail, Result, Context};
     use indexmap::IndexMap;
     use indexmap::map::Entry;
@@ -345,7 +293,7 @@ mod disk_read_engine {
     use std::ops::{Range, RangeInclusive};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
     use tracing::{debug, trace};
 
     const READ_WORKERS: usize = 16;
@@ -504,10 +452,11 @@ mod disk_read_engine {
 
         pub fn get_packets(
             &mut self,
+            phase: Phase,
             retransmit_generation: RetransmitGeneration,
             session_id: SessionId,
-            idx: Range<PacketIdx>,
-            mut tx: impl Fn(Payload),
+            idx: Range<PhaseOffset>,
+            mut tx: impl Fn(Bytes),
         ) -> Result<()> {
             //TODO: Reuse these buffers
             let mut tasks = Vec::new();
@@ -515,6 +464,7 @@ mod disk_read_engine {
             trace!("visiting files to send idx {:?}", idx);
             self.files
                 .visit(
+                    phase,
                     idx.clone(),
                     //TODO: Change from crazy-many parameters to a struct
                     &mut |phase, phase_offset, source, offset, file_size, is_link| {
@@ -651,17 +601,19 @@ mod disk_read_engine {
                     let pktbuf =
                         buf.split_to(PAYLOAD_SIZE_USIZE.min(buf.len())).freeze();
                     trace!("server emitting payload: {} bytes", pktbuf.len());
-                    let eof_approaching = ( output_idx.start == idx.end.saturating_sub(IndexInPhase(PRE_REQUEST_TIME as u64))).then_some(
+                    /*let eof_approaching = ( output_idx.start == idx.end.saturating_sub(IndexInPhase(PRE_REQUEST_TIME as u64))).then_some(
                         idx.end
                     );
-                    debug!("Sending {:?} eof {}", output_idx.start, eof_approaching.is_some());
-                    tx(Payload {
+                    debug!("Sending {:?} eof {}", output_idx.start, eof_approaching.is_some());*/
+
+                    tx(pktbuf);
+                    /*tx(Payload {
                         session_id,
                         retransmit_generation,
                         index: output_idx.start,
                         eof_approaching: eof_approaching.unwrap_or(PacketIdx::INVALID),
                         data: pktbuf,
-                    });
+                    });*/
                     output_idx.start.0 += 1;
                 }
 
@@ -679,17 +631,6 @@ mod disk_read_engine {
             }
         }
 
-        fn successor(&self, index: PacketIdx) -> PacketIdx {
-            let phase = index.phase();
-            let phase_offset = calculate_phase_offset(index.index());
-            if let Some(max_index_of_phase) = self.files.max_offset_exclusive(phase)
-                && phase_offset >= max_index_of_phase
-                && phase as usize != self.files.num_phases()
-            {
-                return PacketIdx::new(phase + 1, IndexInPhase::ZERO);
-            }
-            PacketIdx::new(phase, IndexInPhase(index.index().0 + 1))
-        }
 
         fn get_checksum(
             &mut self,
@@ -769,9 +710,9 @@ mod server {
     use crate::disk_read_engine::ReadEngine;
     use crate::file_set::{FileSet, Meta};
     use crate::messages::{Announce, LinkQualitySignal, Message, Payload, Request};
-    use crate::{overlaps, PacketIdx, RetransmitGeneration, SessionId, DEFAULT_BIND_ADDRESS, MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, DEFAULT_MCAST_ADDR, PhaseOffset};
-    use anyhow::{Result, bail};
-    use bytes::{Bytes, BytesMut};
+    use crate::{overlaps, RetransmitGeneration, SessionId, DEFAULT_BIND_ADDRESS, MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, DEFAULT_MCAST_ADDR, PhaseOffset, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE, PRE_REQUEST_TIME, Phase};    use anyhow::{Result, bail};
+    use bytes::{Buf, Bytes, BytesMut};
+    use flume::Receiver;
     use lru::LruCache;
     use rangemap::RangeMap;
     use savefile::Serialize;
@@ -779,6 +720,7 @@ mod server {
     use tokio::{select, spawn};
     use tracing::{debug, error, info, trace, warn};
     use crate::util::{reusable_multicast_socket, unicast_socket, TSocket, BSocket, blocking_socket, tokio_socket};
+    const FILE_READING_WORKERS: usize = 4;
 
     #[derive(Clone, Debug)]
     pub struct ServerConfig {
@@ -839,12 +781,12 @@ mod server {
 
     struct ServerLogicState {
         session_id: SessionId,
-        tx: flume::Sender<(RetransmitGeneration, Range<PacketIdx>)>,
+        tx: flume::Sender<(RetransmitGeneration, Phase, Range<PhaseOffset>)>,
         recently_sent_last_gc: RetransmitGeneration,
         current_retransmit_generation: RetransmitGeneration,
 
         pack_leader: SocketAddr,
-        packet_leader_position: PacketIdx,
+        packet_leader_position: (Phase, PhaseOffset),
         pack_leader_last_head: Instant,
         pacing: Pacing,
 
@@ -860,10 +802,11 @@ mod server {
     impl ServerLogicState {
         fn send(
             &mut self,
+            phase: Phase,
             generation: RetransmitGeneration,
-            range: impl Iterator<Item = Range<PacketIdx>>,
+            range: impl Iterator<Item = Range<PhaseOffset>>,
         ) {
-            let mut budget = self.pacing.buffer_size_packets as u64;
+            let mut budget = (self.pacing.buffer_size_packets as u64)*PAYLOAD_SIZE;
 
             for mut r in range {
                 let mut r_size = r.end.0 - r.start.0;
@@ -875,7 +818,7 @@ mod server {
                 trace!("Ordering backend to send {:?}: {:?}", generation, r);
 
                 self.tx
-                    .send((generation, r))
+                    .send((generation, phase, r))
                     .expect("background task should not exit");
 
                 budget -= r_size;
@@ -891,13 +834,13 @@ mod server {
             }
 
             let first_section = &r.sections[0];
-            let first_idx = PacketIdx::new(r.phase, first_section.start);
-            if self.pack_leader != src && first_idx < self.packet_leader_position
+            let first_idx = first_section.start;
+            if self.pack_leader != src && (r.phase, first_idx) < self.packet_leader_position
                 || self.pack_leader_last_head.elapsed() > PACK_LEADER_CHANGE_TIME
             {
                 debug!("pack leader changed to {}", src);
                 self.pack_leader = src;
-                self.packet_leader_position = first_idx;
+                self.packet_leader_position = (r.phase, first_idx);
             }
 
             if r.retransmit_generation.0 != self.current_retransmit_generation.0 {
@@ -936,10 +879,10 @@ mod server {
             }
 
             self.send(
+                r.phase,
                 self.current_retransmit_generation,
                 r.sections.into_iter().map(|offset_range| {
-                    PacketIdx::new(r.phase, offset_range.start)
-                        ..PacketIdx::new(r.phase, offset_range.end)
+                    offset_range
                 }),
             );
             Ok(())
@@ -1009,7 +952,7 @@ impl Accumulate {
             unicast_socket: &TSocket, dst: SocketAddr, meta: &Meta) -> Result<()> {
             let mut buf = BytesMut::new();
             let msg =Message::Announce(Announce {
-                session_id: session_id,
+                session_id,
                 fileset_size: meta.fileset_buf.len() as u64,
                 phases: meta.phases,
                 file_count: meta.file_count,
@@ -1024,7 +967,7 @@ impl Accumulate {
         }
 
         pub async fn file_fetching_worker(
-            rx: flume::Receiver<(RetransmitGeneration, Range<PacketIdx>)>,
+            rx: flume::Receiver<(RetransmitGeneration,Phase, Range<PhaseOffset>)>,
             session_id: SessionId,
             config: ServerConfig,
             mut read_engine: ReadEngine,
@@ -1041,12 +984,21 @@ impl Accumulate {
             let max_buf_size_bytes = (socket.max_send_batch() * MTU_USIZE).min(MAX_GSO_BYTES);
             debug!("Max buf size: {}", max_buf_size_bytes);
 
-            // TODO: Introduce constant
+            let mut socket_send_txs = vec![];
+            let mut socket_send_rxs = vec![];
+
             let (socket_send_tx, socket_send_rx) = flume::bounded::<SendEvent>(1000);
 
+            //TODO: Hardcode
+            for _ in 0..FILE_READING_WORKERS {
+                let (socket_send_tx, socket_send_rx) = flume::bounded::<SendEvent>(1000);
+                socket_send_txs.push(socket_send_tx);
+                socket_send_rxs.push(socket_send_rx);
+            }
+            // TODO: Introduce constant
+
             enum SendEvent {
-                Prepare(Range<PacketIdx>),
-                Payload(Payload)
+                Prepare(RetransmitGeneration, Phase, Range<PhaseOffset>, Receiver<Bytes>),
             }
 
             std::thread::spawn(move||{
@@ -1056,52 +1008,105 @@ impl Accumulate {
                     send_buf: BytesMut::with_capacity(max_buf_size_bytes),
                     config,
                 };
-                let mut cur_range = PacketIdx::INVALID .. PacketIdx::INVALID;
+                //let mut cur_range = PacketIdx::INVALID .. PacketIdx::INVALID;
                 #[derive(Clone)]
                 enum PayloadBucket {
                     Awaiting,
                     Present(Payload),
                     Sent
                 }
-                let mut payloads = vec![];
-                let mut pointer = 0;
+
+                let mut scratch = BytesMut::with_capacity(2*MTU_USIZE);
+                let mut outbuf = BytesMut::with_capacity(u16::MAX as usize);
                 loop {
                     let pre_recv_work = Instant::now();
+
+                    println!("BAckground worker waiting for new order");
                     let Ok(ev) = socket_send_rx.recv() else {
                         info!("exiting socket send thread");
                         return;
                     };
+
                     if pre_recv_work.elapsed().as_millis() > 1 {
                         trace!("Receiving new work took {:?}", pre_recv_work.elapsed());
                     }
+
                     match ev {
-                        SendEvent::Prepare(rng) => {
-                            debug_assert!(cur_range.is_empty());
-                            assert_eq!(rng.start.phase(), rng.end.phase());
-                            payloads.clear();
-                            cur_range = rng.clone();
-                            payloads.resize((rng.end.0 - rng.start.0) as usize, PayloadBucket::Awaiting);
-                            pointer = 0;
-                        }
-                        SendEvent::Payload(p) => {
-                            assert!(p.index >= cur_range.start);
-                            assert!(p.index < cur_range.end);
-                            let offset = (p.index.0 - cur_range.start.0) as usize;
-                            if matches!(payloads[offset], PayloadBucket::Awaiting) {
-                                payloads[offset] = PayloadBucket::Present(p);
+                        SendEvent::Prepare(retransmit_generation, phase, mut range, sub_receiver) => {
+
+                            println!("Background sender received {range:?}");
+                            if range.is_empty() {
+                                error!("internal error - total size was 0");
+                                continue;
+                            }
+
+                            let mut output_idx = range.start;
+
+                            let mut emitted_packets = 0;
+                            let eof_index = (range.end-range.start).div_ceil(MTU) - (PRE_REQUEST_TIME as u64);
+
+                            let mut add_payload = |outbuf: &mut BytesMut, data: Bytes| -> bool {
+                                let datalen = data.len();
+                                let payload = Payload {
+                                    session_id,
+                                    retransmit_generation,
+                                    phase,
+                                    index: output_idx,
+                                    eof_approaching:
+                                    (eof_index == emitted_packets).then_some(range.end).unwrap_or(PhaseOffset::INVALID),
+                                    data,
+                                };
+                                accumulator.send(payload);
+
+                                emitted_packets += 1;
+                                output_idx = output_idx + datalen as u64;
+                                //println!("output_idx now:{:?}, range.end = {:?}", output_idx, range.end);
+                                if output_idx == range.end {
+                                    accumulator.flush();
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+
+                            scratch.clear();
+                            loop {
+                                let Ok(mut fragment) = sub_receiver.recv() else {
+                                    info!("sub_receiver exited");
+                                    //println!("sub_receiver exited");
+                                    if !scratch.is_empty() {
+                                        _ = add_payload(&mut outbuf, scratch.split().freeze());
+                                        scratch.clear();
+                                    }
+                                    break;
+                                };
+                                //println!("Background job received {} bytes", fragment.len());
+                                if !scratch.is_empty() {
+                                    assert!(fragment.len() < PAYLOAD_SIZE_USIZE); //TODO: remove
+                                    let scratch_missing = fragment.len() - PAYLOAD_SIZE_USIZE;
+                                    let take = scratch_missing.min(fragment.len());
+                                    scratch.extend_from_slice(&fragment[..take]);
+                                    fragment.advance(take);
+                                }
+                                assert!(scratch.len() <= PAYLOAD_SIZE_USIZE);
+
+                                if scratch.len() == PAYLOAD_SIZE_USIZE {
+                                    if add_payload(&mut outbuf, scratch.split().freeze()) {
+                                        break;
+                                    }
+                                    scratch.clear();
+                                } else if scratch.is_empty() {
+
+                                    while fragment.len() >= PAYLOAD_SIZE_USIZE {
+                                        let send = fragment.split_to(PAYLOAD_SIZE_USIZE);
+                                        if add_payload(&mut outbuf, send) {
+                                            break;
+                                        }
+                                    }
+                                    scratch.extend_from_slice(&fragment);
+                                }
                             }
                         }
-                    }
-
-                    while pointer < payloads.len() && let PayloadBucket::Present(pkt) = &payloads[pointer] {
-                        let PayloadBucket::Present(pkt) = std::mem::replace(&mut payloads[pointer], PayloadBucket::Sent) else {
-                            unreachable!();
-                        };
-                        accumulator.send(pkt);
-                        pointer += 1;
-                    }
-                    if pointer == payloads.len() {
-                        accumulator.flush();
                     }
                 }
             });
@@ -1114,7 +1119,7 @@ impl Accumulate {
                 //let mut prefetched_range: LruCache<PacketIdx, Payload> = LruCache::new(NonZeroUsize::new(1000).unwrap());
                 loop {
 
-                    let Ok((generation, pkts)) = rx.recv() else {
+                    let Ok((generation, phase, pkts)) = rx.recv() else {
                         info!("worker exiting");
                         return;
                     };
@@ -1124,13 +1129,13 @@ impl Accumulate {
                     println!("file fetching worker ordered to fetch {:?}.{:?}", generation, pkts);
                     let bef_gp = Instant::now();
 
-                    _ = socket_send_tx.send(SendEvent::Prepare(pkts.clone()));
+                    let (tx,rx) = flume::bounded(1000); //TODO: Constant
 
-
+                    _ = socket_send_tx.send(SendEvent::Prepare(generation, phase, pkts.clone(), rx));
 
                     let result = read_engine
-                        .get_packets(generation, session_id, pkts, |pkt| {
-                            _ = socket_send_tx.send(SendEvent::Payload(pkt));
+                        .get_packets(phase, generation, session_id, pkts, |pkt| {
+                            _ = tx.send(pkt);
                         });
 
                     let bef_el = bef_gp.elapsed();
@@ -1173,7 +1178,7 @@ impl Accumulate {
                     recently_sent_last_gc: RetransmitGeneration(0),
                     current_retransmit_generation: RetransmitGeneration(0),
                     pack_leader: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
-                    packet_leader_position: PacketIdx(0),
+                    packet_leader_position:(Phase(0), PhaseOffset(0)),
                     pack_leader_last_head: Instant::now(),
                     pacing: Pacing::default(),
 
@@ -1260,7 +1265,7 @@ mod client {
     use std::io::{IoSliceMut, Seek, SeekFrom, Write};
     use crate::file_set::{AtomicChecksum, FileSet};
     use crate::messages::{LinkQualitySignal, Message, Request};
-    use crate::{PhaseOffset, SessionId, MTU_USIZE, PacketIdx, calculate_phase_offset, RetransmitGeneration, DEFAULT_BIND_ADDRESS, DEFAULT_MCAST_ADDR, CHECKSUM_SIZE_U64, CHECKSUM_SIZE, contains, IndexInPhase};
+    use crate::{PhaseOffset, SessionId, MTU_USIZE, RetransmitGeneration, DEFAULT_BIND_ADDRESS, DEFAULT_MCAST_ADDR, CHECKSUM_SIZE_U64, CHECKSUM_SIZE, contains, Phase};
     use anyhow::{anyhow, bail, Result, Context};
     use savefile::{Deserialize, Deserializer, Serialize};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -1306,7 +1311,7 @@ mod client {
             buf: Vec<u8>
         },
         Receiving {
-            phases: Vec<(u16/*phase*/, PhaseOffset/*size*/)>,
+            phases: Vec<(Phase/*phase*/, PhaseOffset/*size*/)>,
             fileset: FileSetDiskWriter,
             session_id: SessionId,
             server: SocketAddrV4,
@@ -1321,8 +1326,8 @@ mod client {
     }
 
     trait BlockReceiver {
-        async fn write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()>;
-        fn try_write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool>;
+        async fn write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()>;
+        fn try_write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool>;
 
     }
 
@@ -1330,7 +1335,7 @@ mod client {
         /// The Range is the completely transferred range that this write is a part of.
         ///
         /// The completeness assumes this write has occurred.
-        Write(PacketIdx, Bytes, Range<PhaseOffset> /*completed subpart*/),
+        Write(Phase, PhaseOffset, Bytes, Range<PhaseOffset> /*completed subpart*/),
     }
     struct FileSetDiskWriter {
         jhs: Vec<JoinHandle<Result<()>>>,
@@ -1402,7 +1407,7 @@ mod client {
             struct CurFile {
                 path: PathBuf,
                 file: File,
-                phase: u16,
+                phase: Phase,
             }
 
             for _ in 0..WRITE_WORKERS {
@@ -1422,15 +1427,15 @@ mod client {
                         };
                         match ev {
                             // TODO: Buffer recycling?
-                            DiskWriteCommand::Write(input_idx, mut bytes, completed_range) => {
+                            DiskWriteCommand::Write(phase, input_idx, mut bytes, completed_range) => {
                                 //TODO: Error handling!
-                                let input_phase = input_idx.phase();
-                                let mut cur_phase_offset = calculate_phase_offset(input_idx.index());
+                                let input_phase = phase;
+                                let mut cur_phase_offset = input_idx;
                                 let mut end_phase_offset = cur_phase_offset + bytes.len() as u64;
 
                                 while cur_phase_offset != end_phase_offset {
 
-                                    trace!("Processing phase {} {} byte write at {:?} (cur phase_offset.end: {:?})", input_phase, bytes.len(), cur_phase_offset, end_phase_offset);
+                                    trace!("Processing phase {:?} {} byte write at {:?} (cur phase_offset.end: {:?})", input_phase, bytes.len(), cur_phase_offset, end_phase_offset);
 
                                     let need = cursor.seek(input_phase, cur_phase_offset)?;
                                     if let Some(curfile_inner) = curfile.as_mut() {
@@ -1516,27 +1521,23 @@ mod client {
     }
 
     impl BlockReceiver for FileSetDiskWriter {
-        async fn write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
-            Ok(self.tx.send_async(DiskWriteCommand::Write(dest, data, completed_range)).await?)
+        async fn write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
+            Ok(self.tx.send_async(DiskWriteCommand::Write(phase, dest, data, completed_range)).await?)
         }
 
-        fn try_write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool> {
-            Ok(self.tx.try_send(DiskWriteCommand::Write(dest, data, completed_range)).is_ok())
+        fn try_write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool> {
+            Ok(self.tx.try_send(DiskWriteCommand::Write(phase, dest, data, completed_range)).is_ok())
         }
     }
 
 
     impl BlockReceiver for Vec<u8> {
-        async fn write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
-            self.try_write(dest, data, completed_range)?;
+        async fn write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
+            self.try_write(phase, dest, data, completed_range)?;
             Ok(())
         }
 
-        fn try_write(&mut self, dest: PacketIdx, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool> {
-            if dest.phase() != 0 {
-                bail!("wrong phase for initialization");
-            }
-            let dest = calculate_phase_offset(dest.index());
+        fn try_write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool> {
             trace!("block size: {}, dest: {}", self.len(), dest.0);
             self[dest.0 as usize .. dest.0 as usize + data.len()].copy_from_slice(&data);
             Ok(true)
@@ -1555,7 +1556,7 @@ mod client {
             recv_socket: &TSocket,
             send_socket: &TSocket,
             mut receiver: &mut impl BlockReceiver,
-            phases: &[(u16/*phase*/, PhaseOffset/*size*/)],
+            phases: &[(Phase/*phase*/, PhaseOffset/*size*/)],
             peer: SocketAddrV4,
 
         ) -> Result<()> {
@@ -1563,18 +1564,18 @@ mod client {
             /// Missing range per phase
             let mut missing = vec![];
             for (phase,phase_size) in phases.iter().copied() {
-                if missing.len() < phase as usize + 1 {
-                    missing.resize(phase as usize + 1, RangeSet::new());
+                if missing.len() < phase.0 as usize + 1 {
+                    missing.resize(phase.0 as usize + 1, RangeSet::new());
                 }
                 let mut s = RangeSet::new();
                 s.insert(PhaseOffset(0)..phase_size);
-                missing[phase as usize] = s;
+                missing[phase.0 as usize] = s;
             }
 
             let mut sendbuf = BytesMut::new();
 
-            async fn send_request(mut scratchbuf: &mut BytesMut, send_socket: &TSocket, phase: u16, session_id: SessionId, missing: impl Iterator<Item=&Range<PhaseOffset>>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4, disallowed_range: Option<Range<PhaseOffset>>) -> Result<()> {
-                let mut sections: ArrayVec<Range<IndexInPhase>, {super::messages::MAX_SECTIONS_PER_REQUEST}> = ArrayVec::new();
+            async fn send_request(mut scratchbuf: &mut BytesMut, send_socket: &TSocket, phase: Phase, session_id: SessionId, missing: impl Iterator<Item=&Range<PhaseOffset>>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4, disallowed_range: Option<Range<PhaseOffset>>) -> Result<()> {
+                let mut sections: ArrayVec<Range<PhaseOffset>, {super::messages::MAX_SECTIONS_PER_REQUEST}> = ArrayVec::new();
                 trace!("Disallowed range: {:?}", disallowed_range);
                 for mut rng in missing.cloned() {
                     trace!("Considering {:?}", rng);
@@ -1601,8 +1602,8 @@ mod client {
                     }
                     trace!("cut to: {:?}", rng);
 
-                    let mut start = rng.start.floor_index();
-                    let end = rng.end.ceil_index();
+                    let mut start = rng.start;
+                    let end = rng.end;
 
                     if let Some(prev) = (&sections).last() {
                         if end <= prev.end {
@@ -1691,7 +1692,7 @@ mod client {
 
                 'phaseloop: loop {
 
-                    debug!("working on phase {} in client", phase);
+                    debug!("working on phase {:?} in client", phase);
                     //let recv_start = Instant::now();
 
                     /* TODO: Cleanup
@@ -1730,7 +1731,7 @@ mod client {
                     let Ok(result) = result else {
                         trace!("timeout");
                         println!("timeout");
-                        let phase_missing = &missing[*phase as usize];
+                        let phase_missing = &missing[phase.0 as usize];
                         send_request(&mut sendbuf,&send_socket, *phase, session_id,
                                                phase_missing.iter(), last_retransmit_generation, loss, peer, None
                         ).await?;
@@ -1760,7 +1761,7 @@ mod client {
                                     }
                                     Message::Payload(p) => {
                                         trace!("Received {:?} (eof: {:?})", p.index, p.eof_approaching);
-                                        if p.index.phase() != *phase {
+                                        if p.phase != *phase {
                                         } else {
 
                                             bytes_received += p.data.len() as u64 - CHECKSUM_SIZE_U64;
@@ -1783,11 +1784,11 @@ mod client {
                                                 last_retransmit_generation_update_counter += 1;
                                             }
 
-                                            let range_start = calculate_phase_offset(p.index.index());
+                                            let range_start = p.index;
                                             let range = range_start..PhaseOffset(range_start.0 + p.data.len() as u64);
 
                                             trace!("client received payload for range {:?} (data len {})", range, p.data.len());
-                                            let phase_missing = &mut missing[*phase as usize];
+                                            let phase_missing = &mut missing[phase.0 as usize];
                                             let holes_before = phase_missing.len();
 
                                             //TODO: Implement leadership support for client too
@@ -1810,28 +1811,28 @@ mod client {
                                                     }
                                                 }
 
-                                                let missing_range_end = phase_missing.overlapping(range.end..PhaseOffset::MAX_OFFSET).next().cloned();
+                                                let missing_range_end = phase_missing.overlapping(range.end..PhaseOffset::MAX).next().cloned();
                                                 let missing_range_start = phase_missing.overlapping(PhaseOffset::ZERO..range.start).rev().next().cloned();
                                                 trace!("search for missing tree: {:?}", phase_missing);
                                                 trace!("search for missing after {:?} got {:?}", range.end, missing_range_end);
                                                 trace!("search for missing before {:?} got {:?}", range.start, missing_range_start);
-                                                let consecutive_non_missing_range = missing_range_start.map(|x| x.end).unwrap_or(PhaseOffset::ZERO)..missing_range_end.map(|x| x.start).unwrap_or(PhaseOffset::MAX_OFFSET);
+                                                let consecutive_non_missing_range = missing_range_start.map(|x| x.end).unwrap_or(PhaseOffset::ZERO)..missing_range_end.map(|x| x.start).unwrap_or(PhaseOffset::MAX);
                                                 trace!("current gap - non-missing offsets: {:?}", consecutive_non_missing_range);
                                                 assert!(consecutive_non_missing_range.start <= consecutive_non_missing_range.end);
 
                                                 let writ_time = Instant::now();
-                                                if !receiver.try_write(p.index, p.data.clone(), consecutive_non_missing_range.clone())? {
-                                                    receiver.write(p.index, p.data, consecutive_non_missing_range).await?;
+                                                if !receiver.try_write(p.phase, p.index, p.data.clone(), consecutive_non_missing_range.clone())? {
+                                                    receiver.write(p.phase, p.index, p.data, consecutive_non_missing_range).await?;
                                                 }
                                                 //println!("receiver write took {:?}", writ_time.elapsed());
 
 
-                                                if p.eof_approaching != PacketIdx::INVALID {
+                                                if p.eof_approaching != PhaseOffset::INVALID {
                                                     trace!("Eof approaching");
                                                     let next_to_send = p.eof_approaching;
-                                                    assert_eq!(next_to_send.phase(), *phase); //TODO: Error handling
+                                                    assert_eq!(p.phase, *phase); //TODO: Error handling
 
-                                                    let allowed_range_start = calculate_phase_offset(next_to_send.index());
+                                                    let allowed_range_start = next_to_send;
                                                     let disallowed_range = range.start .. allowed_range_start;
 
 
@@ -1842,7 +1843,7 @@ mod client {
                                                 }
                                                 {
                                                     if phase_missing.is_empty() {
-                                                        debug!("Client exiting phase loop for phase {}", phase);
+                                                        debug!("Client exiting phase loop for phase {:?}", phase);
                                                         break 'phaseloop;
                                                     }
                                                 }
@@ -1958,7 +1959,7 @@ mod client {
                         info!("client loading fileset");
                         let phase_0_size = buf.len();
                         ClientProtocolHandler::sync(session_id, &self.recv_socket, &self.send_socket,
-                                                    &mut buf, &[(0,PhaseOffset(phase_0_size as u64))], server
+                                                    &mut buf, &[(Phase(0),PhaseOffset(phase_0_size as u64))], server
                         ).await?;
 
                         let calculated_checksum = blake3::hash(&buf[..buf.len()-CHECKSUM_SIZE]).as_bytes()[0..16].to_vec();
@@ -2011,7 +2012,7 @@ mod client {
 mod file_set {
     use std::borrow::Borrow;
     use crate::file_set::Entry::File;
-    use crate::{byte_range, calculate_phase_offset, overlaps, IndexInPhase, PacketIdx, PhaseOffset, PhaseSize, CHECKSUM_SIZE, CHECKSUM_SIZE_U64};
+    use crate::{overlaps, PhaseOffset, PhaseSize, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, Phase};
     use anyhow::{Error, Result, anyhow, bail};
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
     use rayon::prelude::IntoParallelIterator;
@@ -2232,7 +2233,7 @@ mod file_set {
 
     pub struct FileSetCursor<'a> {
         set: &'a FileSet,
-        cur_phase: u16,
+        cur_phase: Phase,
         stack: Vec<&'a Entry>,
         path: PathBuf,
     }
@@ -2262,11 +2263,11 @@ mod file_set {
                     .into()
             }
         }
-        pub fn seek(&mut self, packet_phase: u16, packet_offset: PhaseOffset) -> Result<WriteNeed> {
-            if packet_phase as usize >= self.set.num_phases() {
+        pub fn seek(&mut self, packet_phase: Phase, packet_offset: PhaseOffset) -> Result<WriteNeed> {
+            if packet_phase.0 as usize >= self.set.num_phases() {
                 bail!("Bad phase");
             }
-            if packet_phase == 0 {
+            if packet_phase.0 == 0 {
                 bail!("FileSetCursor is not intended for use with phase 0");
             }
 
@@ -2284,7 +2285,7 @@ mod file_set {
                 }
 
                 if self.stack.is_empty() {
-                    let FileSetPhaseEntry{ path, entry } = &self.set.phases[packet_phase as usize];
+                    let FileSetPhaseEntry{ path, entry } = &self.set.phases[packet_phase.0 as usize];
                     self.path = path.clone();
                     self.path.push(entry.name());
                     self.stack.push(entry);
@@ -2305,7 +2306,7 @@ mod file_set {
                     }
                     Entry::Directory(d) => {
                         let entry = d.entry_for(packet_offset).expect("we know entry contains range");
-                        debug!("Pushing name {:?}, seek: {}.{:?}, parent start: {:?} sub item range: {:?}", entry.name(), packet_phase, packet_offset,
+                        debug!("Pushing name {:?}, seek: {:?}.{:?}, parent start: {:?} sub item range: {:?}", entry.name(), packet_phase, packet_offset,
                                 d.offset,
                                  entry.first_offset()..entry.last_offset_exclusive());
                         self.path.push(entry.name());
@@ -2333,10 +2334,10 @@ mod file_set {
     impl FileSet {
 
         /// Phase 0 is exlcuded
-        pub(crate) fn get_phases_excluding_first_phase(&self) -> Vec<(u16, PhaseOffset)> {
+        pub(crate) fn get_phases_excluding_first_phase(&self) -> Vec<(Phase, PhaseOffset)> {
             let mut output = vec![];
             for (i,FileSetPhaseEntry{entry,..}) in self.phases.iter().enumerate().skip(1) {
-                output.push((i as u16, entry.last_offset_exclusive()))
+                output.push((Phase(i as u16), entry.last_offset_exclusive()))
             }
             output
         }
@@ -2345,7 +2346,7 @@ mod file_set {
         pub fn make_cursor<'a>(&'a self) -> FileSetCursor<'a> {
             FileSetCursor {
                 set: self,
-                cur_phase: 0,
+                cur_phase: Phase(0),
                 stack: vec![],
                 path: Default::default(),
             }
@@ -2384,15 +2385,16 @@ mod file_set {
         /// Always visits in PhaseOffset-order, guaranteed
         pub fn visit<'a>(
             &self,
-            range: Range<PacketIdx>,
-            f: &mut impl FnMut(u16, Range<PhaseOffset>, Source, u64, u64, Kind)
+            phase: Phase,
+            range: Range<PhaseOffset>,
+            f: &mut impl FnMut(Phase, Range<PhaseOffset>, Source, u64, u64, Kind)
         ) -> Result<()> {
 
-            for (phase, range) in PacketIdx::phases(range, self) {
-                trace!("Fetch sub-range {}.{:?}", phase, range);
+            {
+                trace!("Fetch sub-range {:?}.{:?}", phase, range);
                 let byte_range = range;
-                let mut cwd = self.phases[phase as usize].path.clone();
-                self.phases[phase as usize].entry.visit(
+                let mut cwd = self.phases[phase.0 as usize].path.clone();
+                self.phases[phase.0 as usize].entry.visit(
                     &mut cwd,
                     byte_range,
                     &mut |phase_offset, source, offset, file_size, is_link| {
@@ -2748,6 +2750,7 @@ mod util {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
     use bytes::BytesMut;
+    use futures_util::stream::Peek;
     use quinn_udp::{RecvMeta, Transmit, UdpSocketState};
     use socket2::{Domain, Protocol, Socket, Type};
     use tokio::io::Interest;
@@ -2757,6 +2760,32 @@ mod util {
     use tracing_subscriber::layer::SubscriberExt;
     use crate::MTU_USIZE;
 
+    struct PeekableReceiver<T> {
+        inner: flume::Receiver<T>,
+        peeked: Option<T>,
+    }
+
+    impl<T> PeekableReceiver<T> {
+        pub fn peek(&mut self) -> Option<&T> {
+            if self.peeked.is_some() {
+                return self.peeked.as_ref();
+            }
+            if let Ok(t) = self.inner.try_recv() {
+                self.peeked = Some(t);
+                return self.peeked.as_ref();
+            }
+            None
+        }
+        pub fn recv(&mut self) -> Result<T, flume::RecvError> {
+            if let Some(p) = self.peeked.take() {
+                return Ok(p);
+            }
+            self.inner.recv()
+        }
+    }
+
+
+    //TODO: Get rid of this?
     pub fn fast_hash(bytes: &[u8]) -> u64 {
         const K: u64 = 0x517c_c1b7_2722_0a95; // odd, well-mixed constant
 
