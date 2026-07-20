@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZero;
 use crate::file_set::FileSet;
@@ -297,7 +297,7 @@ mod disk_read_engine {
     use std::sync::Arc;
     use bytes::{Bytes, BytesMut};
     use tracing::{debug, trace};
-    use crate::disk_read_engine::ChecksummingState::Finished;
+    use crate::util::ChecksummingState;
 
     const READ_WORKERS: usize = 16;
     const CACHE_SIZE_PACKETS: usize = 10000;
@@ -335,72 +335,6 @@ mod disk_read_engine {
         response: flume::Sender<Buf>,
     }
 
-    //TODO: Move to util?
-    #[derive(Debug, Clone)]
-    pub enum ChecksummingState {
-        Hashing { hasher: blake3::Hasher, offset: u64},
-        Finished([u8; CHECKSUM_SIZE]),
-    }
-
-    impl ChecksummingState {
-        pub fn finished(&self) -> bool {
-            match self {
-                ChecksummingState::Hashing {..} => false,
-                ChecksummingState::Finished(..) => true,
-            }
-        }
-        pub fn update(&mut self, offset: u64, mut cur_read_bytes: &[u8], real_file_size: u64) {
-            if offset >= real_file_size {
-                return;
-            }
-            if offset + cur_read_bytes.len() as u64 > real_file_size {
-                let overflow = offset + cur_read_bytes.len() as u64 - real_file_size;
-                cur_read_bytes = &cur_read_bytes[..cur_read_bytes.len() - overflow as usize];
-            }
-            match self {
-                ChecksummingState::Hashing {
-                    hasher,
-                    offset: already_hashed_offset,
-                } => {
-                    let chunk_size = cur_read_bytes.len() as u64;
-
-                    if offset + chunk_size > *already_hashed_offset && offset <= *already_hashed_offset
-                    {
-                        /*if hashed_bytes.len() < (offset + chunk_size) as usize {
-                            hashed_bytes.resize((offset + chunk_size) as usize, 0);
-                            hashed_bytes[offset as usize..offset as usize+chunk_size as usize].copy_from_slice(&cur_read_bytes);
-                        }*/
-
-                        let new_part_start_at = *already_hashed_offset - offset;
-                        let new_part_size = (offset + chunk_size) - *already_hashed_offset;
-                        let upd_part = &cur_read_bytes[new_part_start_at as usize
-                            ..(new_part_start_at + new_part_size) as usize];
-                        //println!("Hashing with update-part: {}", String::from_utf8_lossy(upd_part));
-                        hasher.update(
-                            upd_part,
-                        );
-                        *already_hashed_offset = offset + chunk_size;
-                        if offset + chunk_size == real_file_size {
-                            let hash: [u8; CHECKSUM_SIZE] =
-                                hasher.finalize().as_bytes()[0..16].try_into().unwrap();
-                            *self = ChecksummingState::Finished(hash/*, hashed_bytes.clone()*/);
-                        }
-                    }
-                }
-                ChecksummingState::Finished(_) => {}
-            }
-        }
-    }
-
-    impl Default for ChecksummingState {
-        fn default() -> Self {
-            Self::Hashing {
-                hasher: Default::default(),
-                offset: 0,
-                //hashed_bytes: vec![],
-            }
-        }
-    }
 
     #[derive(Clone)]
     pub struct ReadEngine {
@@ -1357,8 +1291,8 @@ mod client {
     use tokio::spawn;
     use tokio::task::JoinHandle;
     use tracing::{debug, error, info, trace};
-    use crate::disk_read_engine::ChecksummingState;
-    use crate::util::{reusable_multicast_socket, unicast_socket, TSocket, tokio_socket};
+
+    use crate::util::{reusable_multicast_socket, unicast_socket, TSocket, tokio_socket, ChecksummingState};
 
     pub struct ClientConfig {
         pub paths: Vec<PathBuf>,
@@ -3007,7 +2941,7 @@ mod util {
     use tracing::{info, warn};
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
-    use crate::MTU_USIZE;
+    use crate::{CHECKSUM_SIZE, MTU_USIZE};
 
     struct PeekableReceiver<T> {
         inner: flume::Receiver<T>,
@@ -3294,6 +3228,73 @@ mod util {
         info!("Tracing enabled");
     }
 
+
+    //TODO: Move to util?
+    #[derive(Debug, Clone)]
+    pub enum ChecksummingState {
+        Hashing { hasher: blake3::Hasher, offset: u64},
+        Finished([u8; CHECKSUM_SIZE]),
+    }
+
+    impl ChecksummingState {
+        pub fn finished(&self) -> bool {
+            match self {
+                ChecksummingState::Hashing {..} => false,
+                ChecksummingState::Finished(..) => true,
+            }
+        }
+        pub fn update(&mut self, offset: u64, mut cur_read_bytes: &[u8], real_file_size: u64) {
+            if offset >= real_file_size {
+                return;
+            }
+            if offset + cur_read_bytes.len() as u64 > real_file_size {
+                let overflow = offset + cur_read_bytes.len() as u64 - real_file_size;
+                cur_read_bytes = &cur_read_bytes[..cur_read_bytes.len() - overflow as usize];
+            }
+            match self {
+                ChecksummingState::Hashing {
+                    hasher,
+                    offset: already_hashed_offset,
+                } => {
+                    let chunk_size = cur_read_bytes.len() as u64;
+
+                    if offset + chunk_size > *already_hashed_offset && offset <= *already_hashed_offset
+                    {
+                        /*if hashed_bytes.len() < (offset + chunk_size) as usize {
+                            hashed_bytes.resize((offset + chunk_size) as usize, 0);
+                            hashed_bytes[offset as usize..offset as usize+chunk_size as usize].copy_from_slice(&cur_read_bytes);
+                        }*/
+
+                        let new_part_start_at = *already_hashed_offset - offset;
+                        let new_part_size = (offset + chunk_size) - *already_hashed_offset;
+                        let upd_part = &cur_read_bytes[new_part_start_at as usize
+                            ..(new_part_start_at + new_part_size) as usize];
+                        //println!("Hashing with update-part: {}", String::from_utf8_lossy(upd_part));
+                        hasher.update(
+                            upd_part,
+                        );
+                        *already_hashed_offset = offset + chunk_size;
+                        if offset + chunk_size == real_file_size {
+                            let hash: [u8; CHECKSUM_SIZE] =
+                                hasher.finalize().as_bytes()[0..16].try_into().unwrap();
+                            *self = ChecksummingState::Finished(hash/*, hashed_bytes.clone()*/);
+                        }
+                    }
+                }
+                ChecksummingState::Finished(_) => {}
+            }
+        }
+    }
+
+    impl Default for ChecksummingState {
+        fn default() -> Self {
+            Self::Hashing {
+                hasher: Default::default(),
+                offset: 0,
+                //hashed_bytes: vec![],
+            }
+        }
+    }
 
 
 }
