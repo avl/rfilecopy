@@ -16,6 +16,7 @@ use crate::client::ClientConfig;
 use crate::server::{ServerConfig, ServerState};
 use crate::util::setup_tracing;
 
+
 pub const CHECKSUM_SIZE: usize = 16;
 pub const CHECKSUM_SIZE_U64: u64 = CHECKSUM_SIZE as u64;
 
@@ -73,7 +74,7 @@ pub struct PhaseOffset(pub u64);
 
 
 trait PhaseSize {
-    fn max_offset_exclusive(&self, phase: u16) -> Option<PhaseOffset>;
+    fn max_offset_exclusive(&self, phase: Phase) -> Option<PhaseOffset>;
 }
 
 pub fn overlaps<T: Ord>(a: Range<T>, b: Range<T>) -> Option<Range<T>> {
@@ -296,6 +297,7 @@ mod disk_read_engine {
     use std::sync::Arc;
     use bytes::{Bytes, BytesMut};
     use tracing::{debug, trace};
+    use crate::disk_read_engine::ChecksummingState::Finished;
 
     const READ_WORKERS: usize = 16;
     const CACHE_SIZE_PACKETS: usize = 10000;
@@ -333,10 +335,61 @@ mod disk_read_engine {
         response: flume::Sender<Buf>,
     }
 
+    //TODO: Move to util?
     #[derive(Debug, Clone)]
     pub enum ChecksummingState {
-        Hashing { hasher: blake3::Hasher, offset: u64, hashed_bytes: Vec<u8> },
-        Finished([u8; CHECKSUM_SIZE], Vec<u8>),
+        Hashing { hasher: blake3::Hasher, offset: u64},
+        Finished([u8; CHECKSUM_SIZE]),
+    }
+
+    impl ChecksummingState {
+        pub fn finished(&self) -> bool {
+            match self {
+                ChecksummingState::Hashing {..} => false,
+                ChecksummingState::Finished(..) => true,
+            }
+        }
+        pub fn update(&mut self, offset: u64, mut cur_read_bytes: &[u8], real_file_size: u64) {
+            if offset >= real_file_size {
+                return;
+            }
+            if offset + cur_read_bytes.len() as u64 > real_file_size {
+                let overflow = offset + cur_read_bytes.len() as u64 - real_file_size;
+                cur_read_bytes = &cur_read_bytes[..cur_read_bytes.len() - overflow as usize];
+            }
+            match self {
+                ChecksummingState::Hashing {
+                    hasher,
+                    offset: already_hashed_offset,
+                } => {
+                    let chunk_size = cur_read_bytes.len() as u64;
+
+                    if offset + chunk_size > *already_hashed_offset && offset <= *already_hashed_offset
+                    {
+                        /*if hashed_bytes.len() < (offset + chunk_size) as usize {
+                            hashed_bytes.resize((offset + chunk_size) as usize, 0);
+                            hashed_bytes[offset as usize..offset as usize+chunk_size as usize].copy_from_slice(&cur_read_bytes);
+                        }*/
+
+                        let new_part_start_at = *already_hashed_offset - offset;
+                        let new_part_size = (offset + chunk_size) - *already_hashed_offset;
+                        let upd_part = &cur_read_bytes[new_part_start_at as usize
+                            ..(new_part_start_at + new_part_size) as usize];
+                        //println!("Hashing with update-part: {}", String::from_utf8_lossy(upd_part));
+                        hasher.update(
+                            upd_part,
+                        );
+                        *already_hashed_offset = offset + chunk_size;
+                        if offset + chunk_size == real_file_size {
+                            let hash: [u8; CHECKSUM_SIZE] =
+                                hasher.finalize().as_bytes()[0..16].try_into().unwrap();
+                            *self = ChecksummingState::Finished(hash/*, hashed_bytes.clone()*/);
+                        }
+                    }
+                }
+                ChecksummingState::Finished(_) => {}
+            }
+        }
     }
 
     impl Default for ChecksummingState {
@@ -344,7 +397,7 @@ mod disk_read_engine {
             Self::Hashing {
                 hasher: Default::default(),
                 offset: 0,
-                hashed_bytes: vec![],
+                //hashed_bytes: vec![],
             }
         }
     }
@@ -543,37 +596,8 @@ mod disk_read_engine {
                 let cur_read_bytes = &buf[buflen..];
                 assert_eq!(cur_read_bytes.len(), chunk_size as usize);
 
-                match cksumstate {
-                    ChecksummingState::Hashing {
-                        hasher,
-                        offset: already_hashed_offset,
-                        hashed_bytes
-                    } => {
-
-                        if offset + chunk_size > *already_hashed_offset && offset <= *already_hashed_offset
-                        {
-                            if hashed_bytes.len() < (offset + chunk_size) as usize {
-                                hashed_bytes.resize((offset + chunk_size) as usize, 0);
-                                hashed_bytes[offset as usize..offset as usize+chunk_size as usize].copy_from_slice(&cur_read_bytes);
-                            }
-
-                            let new_part_start_at = *already_hashed_offset - offset;
-                            let new_part_size = (offset + chunk_size) - *already_hashed_offset;
-                            let upd_part = &cur_read_bytes[new_part_start_at as usize
-                                ..(new_part_start_at + new_part_size) as usize];
-                            //println!("Hashing with update-part: {}", String::from_utf8_lossy(upd_part));
-                            hasher.update(
-                                upd_part,
-                            );
-                            *already_hashed_offset = offset + chunk_size;
-                            if offset + chunk_size == real_file_size {
-                                let hash: [u8; CHECKSUM_SIZE] =
-                                    hasher.finalize().as_bytes()[0..16].try_into().unwrap();
-                                *cksumstate = ChecksummingState::Finished(hash, hashed_bytes.clone());
-                            }
-                        }
-                    }
-                    ChecksummingState::Finished(_,_) => {}
+                if !cksumstate.finished() {
+                    cksumstate.update(offset, cur_read_bytes, real_file_size);
                 }
 
                 if offset <= real_file_size {
@@ -644,7 +668,7 @@ mod disk_read_engine {
                 cksum = Some(self.checksums.entry(source.to_owned_id()).or_default());
             }
             match cksum.as_mut().unwrap() {
-                ChecksummingState::Hashing { hasher, offset, hashed_bytes } => {
+                ChecksummingState::Hashing { hasher, offset/*, hashed_bytes*/ } => {
 
                     match source {
                         OwnedSource::Path(path) => {
@@ -664,7 +688,7 @@ mod disk_read_engine {
                         }
                     }
                 }
-                ChecksummingState::Finished(sum, hashed_bytes) => {
+                ChecksummingState::Finished(sum/*, hashed_bytes*/) => {
                     #[cfg(debug_assertions)]
                     // TODO: Remove duplicate code
                     match source {
@@ -674,13 +698,13 @@ mod disk_read_engine {
                                 .update_mmap_rayon(&path).with_context(||anyhow!("checksumming file {}", path.display()))?   // mmaps the file + hashes it multithreaded
                                 .finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
 
-                            let mut hasher2 = blake3::Hasher::new();
+                            /*let mut hasher2 = blake3::Hasher::new();
                             hasher2.update(hashed_bytes);
-                            let hash2 : [u8;CHECKSUM_SIZE] = hasher2.finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
+                            let hash2 : [u8;CHECKSUM_SIZE] = hasher2.finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();*/
 
 
                             trace!("Hashed bytes: {}", path.display()/*, String::from_utf8_lossy(hashed_bytes)*/);
-                            trace!("Real file hashsum (finished) {:?}, of hashed bytes: {:?}", hash, hash2);
+                            //trace!("Real file hashsum (finished) {:?}, of hashed bytes: {:?}", hash, hash2);
                             assert_eq!(&hash, sum);
                         }
                         OwnedSource::FileSet(buf) => {
@@ -1044,6 +1068,7 @@ impl Accumulate {
                             // Returns bytes remaining
                             let mut add_payload = |outbuf: &mut BytesMut, data: Bytes| {
                                 let datalen = data.len();
+                                assert!(datalen > 0);
                                 let payload = Payload {
                                     pkt_ordinal,
                                     session_id,
@@ -1308,15 +1333,16 @@ impl Accumulate {
 
 mod client {
     use std::fs::{File, OpenOptions};
+    use std::hash::{DefaultHasher, Hash, Hasher};
     use std::io::{IoSliceMut, Seek, SeekFrom, Write};
-    use crate::file_set::{AtomicChecksum, FileSet};
+    use crate::file_set::{hash_path, AtomicChecksum, FileSet, FileSetCursor};
     use crate::messages::{LinkQualitySignal, Message, Request};
     use crate::{PhaseOffset, SessionId, MTU_USIZE, RetransmitGeneration, DEFAULT_BIND_ADDRESS, DEFAULT_MCAST_ADDR, CHECKSUM_SIZE_U64, CHECKSUM_SIZE, contains, Phase};
     use anyhow::{anyhow, bail, Result, Context};
     use savefile::{Deserialize, Deserializer, Serialize};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::ops::Range;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -1331,6 +1357,7 @@ mod client {
     use tokio::spawn;
     use tokio::task::JoinHandle;
     use tracing::{debug, error, info, trace};
+    use crate::disk_read_engine::ChecksummingState;
     use crate::util::{reusable_multicast_socket, unicast_socket, TSocket, tokio_socket};
 
     pub struct ClientConfig {
@@ -1359,7 +1386,7 @@ mod client {
         },
         Receiving {
             phases: Vec<(Phase/*phase*/, PhaseOffset/*size*/)>,
-            fileset: FileSetDiskWriter,
+            fileset: FileSet,
             session_id: SessionId,
             server: SocketAddrV4,
         },
@@ -1374,8 +1401,6 @@ mod client {
 
     trait BlockReceiver {
         async fn write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()>;
-        fn try_write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool>;
-
     }
 
     enum DiskWriteCommand {
@@ -1384,15 +1409,16 @@ mod client {
         /// The completeness assumes this write has occurred.
         Write(Phase, PhaseOffset, Bytes, Range<PhaseOffset> /*completed subpart*/),
     }
-    struct FileSetDiskWriter {
+    struct FileSetDiskWriter<'a> {
+        cursor: FileSetCursor<'a>,
         jhs: Vec<JoinHandle<Result<()>>>,
-        tx: flume::Sender<DiskWriteCommand>,
+        txs: Vec<flume::Sender<DiskWriteCommand>>,
     }
 
-    impl FileSetDiskWriter {
+    impl FileSetDiskWriter<'_> {
         pub async fn shutdown(mut self) -> Result<()> {
-            let Self { jhs, tx } = self;
-            drop(tx);
+            let Self {  jhs, txs, cursor } = self;
+            drop(txs);
 
             for jh in jhs {
                 match jh.await {
@@ -1415,12 +1441,19 @@ mod client {
     /// file complete while it's written by others
     pub const WRITE_WORKERS: usize = 4;
 
-    impl FileSetDiskWriter {
+    impl FileSetDiskWriter<'_> {
         pub async fn new(
-            fileset: FileSet) -> FileSetDiskWriter {
+            fileset: &Arc<FileSet>) -> FileSetDiskWriter<'_> {
 
-            let fileset = Arc::new(fileset);
-            let (tx,rx) = flume::bounded(WRITE_BUFFER_SIZE_PACKETS);
+
+            let mut file_write_txs = vec![];
+            let mut file_write_rxs = vec![];
+
+            for _ in 0..WRITE_WORKERS {
+                let (tx,rx) = flume::bounded((WRITE_BUFFER_SIZE_PACKETS/WRITE_WORKERS).max(1));
+                file_write_txs.push(tx);
+                file_write_rxs.push(rx);
+            }
 
             let (hasher_tx, hasher_rx) = flume::bounded(HASHER_BUFFER_SIZE_PACKETS);
 
@@ -1457,10 +1490,10 @@ mod client {
                 phase: Phase,
             }
 
-            for _ in 0..WRITE_WORKERS {
-                let rx = rx.clone();
+            for rx in file_write_rxs {
                 let fileset = fileset.clone();
                 let mut curfile : Option<CurFile> = None;
+                let mut hashing_state = ChecksummingState::default();
                 let mut hasher_tx = hasher_tx.clone();
 
                 jhs.push(spawn(async move {
@@ -1491,7 +1524,7 @@ mod client {
                                         }
                                     }
                                     if curfile.is_none() {
-
+                                        hashing_state = ChecksummingState::default();
                                         let path = need.path.to_path_buf();
 
                                         if let Some(parent) = path.parent() {
@@ -1507,17 +1540,27 @@ mod client {
                                     }
 
 
-                                    let mut bytes_now = if  bytes.len() as u64 > need.file_size - need.file_offset {
+                                    let mut bytes_now = if bytes.len() as u64 > need.file_size - need.file_offset {
                                         bytes.split_to(need.file_size as usize - need.file_offset as usize)
                                     } else {
                                         bytes.split_to(bytes.len())
                                     };
 
                                     let bytes_now_progress = bytes_now.len();
-
+                                    if bytes_now_progress == 0 {
+                                        panic!("no progress. cur: {:?} end: {:?}",  cur_phase_offset, end_phase_offset);
+                                    }
 
                                     let curfile_ref = curfile.as_mut().unwrap();
                                     let checksum_bytes = (need.file_offset + bytes_now.len() as u64).saturating_sub(need.file_size - CHECKSUM_SIZE_U64).min(bytes_now.len() as u64);
+
+                                    let is_complete;
+                                    {
+                                        let mut written_complete = need.written_complete.lock().unwrap();
+                                        written_complete.insert(need.file_offset..(need.file_offset + bytes_now.len() as u64));
+                                        is_complete = written_complete.is_complete(need.file_size);
+                                    }
+
 
                                     if checksum_bytes > 0 {
                                         let checksum_byte_ref = &bytes_now[bytes_now.len()-checksum_bytes as usize..];
@@ -1525,34 +1568,45 @@ mod client {
                                         trace!("Interpreting bytes at {:?} as checksum bytes for {:?}",
                                             cur_phase_offset, need.path.display()
                                         );
-                                        need.checksum.partial_update(checksum_offset as usize, checksum_byte_ref);
+                                        need.expected_checksum.partial_update(checksum_offset as usize, checksum_byte_ref);
                                         _ = bytes_now.split_off(bytes_now.len() - checksum_bytes as usize);
                                     }
 
-                                    curfile_ref.file.seek(SeekFrom::Start(need.file_offset))?;
-                                    curfile_ref.file.write_all(&bytes_now)?;
+                                    if !bytes_now.is_empty() {
+                                        curfile_ref.file.seek(SeekFrom::Start(need.file_offset))?;
+                                        curfile_ref.file.write_all(&bytes_now)?;
+                                        hashing_state.update(need.file_offset, &bytes_now, need.file_size - CHECKSUM_SIZE_U64);
+                                    }
 
-                                    let written_now = need.written_complete.fetch_add(bytes_now.len() as u64, Ordering::Relaxed) + bytes_now.len() as u64;
 
-                                    if contains(completed_range.clone(), need.file_range.clone()) {
-
-                                        while need.written_complete.load(Ordering::Relaxed) != need.file_size {
-                                            std::thread::sleep(std::time::Duration::from_millis(1));
-                                        }
+                                    if is_complete {
+                                        /*while need.written_complete.load(Ordering::Relaxed) != need.file_size {
+                                            println!("Awaiting {} == {}", need.written_complete.load(Ordering::Relaxed), need.file_size);
+                                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                        }*/
                                         let mut f = curfile.take().unwrap();
                                         //TODO: Make sure empty directories are created.
                                         // Could do as a pass when receiving bytes before empty dir in sequence
-                                        f.file.set_len(need.file_size-CHECKSUM_SIZE_U64)?;
+                                        f.file.set_len(need.file_size - CHECKSUM_SIZE_U64)?;
                                         //TODO: Change expensive asserts to debug_assert
-                                        assert_eq!(need.file_range.end.0-need.file_range.start.0, need.file_size);
+                                        assert_eq!(need.file_range.end.0 - need.file_range.start.0, need.file_size);
                                         debug_assert_eq!(
                                             std::fs::metadata(need.path).unwrap().len(),
                                             need.file_size - CHECKSUM_SIZE_U64
                                         );
                                         trace!("detected that file {} was complete, because completed range is {:?} and file range is {:?}", need.path.display(), completed_range, need.file_range);
-                                        hasher_tx.send_async((need.checksum.clone(), need.path.to_path_buf())).await.expect("hashers do not die");
+
+                                        //println!("On done, hashing state: {:?} filesize: {}", hashing_state, need.file_size);;
+                                        if let ChecksummingState::Finished(hash) = hashing_state {
+                                            if hash != need.expected_checksum.bytes()  {
+                                                panic!("Checksum mismatch for {}", need.path.display());
+                                            }
+                                        } else {
+                                            hasher_tx.send_async((need.expected_checksum.clone(), need.path.to_path_buf())).await.expect("hashers do not die");
+                                        }
 
                                     }
+
 
                                     cur_phase_offset.0 += bytes_now_progress as u64;
 
@@ -1567,34 +1621,52 @@ mod client {
             }
 
             FileSetDiskWriter {
+                cursor: fileset.make_cursor(),
                 jhs,
-                tx
+                txs: file_write_txs
             }
 
         }
     }
 
-    impl BlockReceiver for FileSetDiskWriter {
-        async fn write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
-            Ok(self.tx.send_async(DiskWriteCommand::Write(phase, dest, data, completed_range)).await?)
+
+    impl FileSetDiskWriter<'_> {
+        async fn write_impl(&mut self, phase: Phase, dest: PhaseOffset, mut data: Bytes, completed_range: Range<PhaseOffset>, hash_value : u64) -> Result<()> {
+            Ok(self.txs[(hash_value as usize)%self.txs.len()].send_async(DiskWriteCommand::Write(phase, dest, data, completed_range)).await?)
+        }
+    }
+    impl BlockReceiver for FileSetDiskWriter<'_> {
+        async fn write(&mut self, phase: Phase, mut dest: PhaseOffset, mut data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
+
+            assert!(data.len() > 0 );
+            let mut entry = self.cursor.seek(phase, dest)?;
+            let mut cur_hash = hash_path(entry.path);
+            trace!("Writing {} bytes at {:?} in phase {:?}, tree size: {:?}", data.len(), dest, phase, self.cursor.set_size(phase));
+            while data.len() > 0 {
+
+                let Some((boundary, next_path_hash)) = self.cursor.seek_next_file_boundary() else {
+                    self.write_impl(phase, dest, data, completed_range.clone(), cur_hash).await?;
+                    return Ok(());
+                };
+                let chunk = data.split_to(((boundary.0 - dest.0) as usize).min(data.len()));
+
+                let chunklen = chunk.len();
+                self.write_impl(phase, dest, chunk, completed_range.clone(), cur_hash).await?;
+                dest.0 += chunklen as u64;
+
+                cur_hash = next_path_hash;
+            }
+            Ok(())
         }
 
-        fn try_write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool> {
-            Ok(self.tx.try_send(DiskWriteCommand::Write(phase, dest, data, completed_range)).is_ok())
-        }
     }
 
 
     impl BlockReceiver for Vec<u8> {
         async fn write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
-            self.try_write(phase, dest, data, completed_range)?;
-            Ok(())
-        }
-
-        fn try_write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<bool> {
             trace!("block size: {}, dest: {}", self.len(), dest.0);
             self[dest.0 as usize .. dest.0 as usize + data.len()].copy_from_slice(&data);
-            Ok(true)
+            Ok(())
         }
     }
 
@@ -1776,10 +1848,8 @@ mod client {
                     debug!("client socket call completed or timed out");
 
 
-                    let befrecv = Instant::now();
                     // TODO: Make this timeout variable
-
-                    let result = tokio::time::timeout(Duration::from_millis(2250), recv_socket.recv_multi_from(&mut io_vec_buffers, &mut meta_scratch)).await;
+                    let result = tokio::time::timeout(Duration::from_millis(50), recv_socket.recv_multi_from(&mut io_vec_buffers, &mut meta_scratch)).await;
 
                     //println!("Read time: {:?}", befrecv.elapsed());
                     let Ok(result) = result else {
@@ -1878,9 +1948,11 @@ mod client {
                                                 assert!(consecutive_non_missing_range.start <= consecutive_non_missing_range.end);
 
                                                 let writ_time = Instant::now();
-                                                if !receiver.try_write(p.phase, p.index, p.data.clone(), consecutive_non_missing_range.clone())? {
-                                                    receiver.write(p.phase, p.index, p.data, consecutive_non_missing_range).await?;
-                                                }
+                                                assert!(p.data.len() > 0);
+                                                receiver.write(p.phase, p.index, p.data, consecutive_non_missing_range).await?;
+                                                //if !receiver.try_write(p.phase, p.index, p.data.clone(), consecutive_non_missing_range.clone())? {
+                                                //
+                                                //}
                                                 //println!("receiver write took {:?}", writ_time.elapsed());
 
 
@@ -1892,7 +1964,7 @@ mod client {
                                                     let allowed_range_start = next_to_send;
                                                     let disallowed_range = range.start .. allowed_range_start;
 
-                                                    println!("EOF APPROACHING: {:?} (retran:{:?}, last retran: {:?})", p.eof_approaching, p.retransmit_generation, last_retransmit_generation);
+                                                    //println!("EOF APPROACHING: {:?} (retran:{:?}, last retran: {:?})", p.eof_approaching, p.retransmit_generation, last_retransmit_generation);
                                                     send_request(&mut sendbuf, &send_socket, *phase, session_id,
                                                                            phase_missing.iter(), last_retransmit_generation, loss.clone(), peer, Some(disallowed_range)
                                                     ).await?;
@@ -2034,12 +2106,11 @@ mod client {
                         let phases = fileset.get_phases_excluding_first_phase();
 
 
-                        let writer = FileSetDiskWriter::new(fileset).await;
 
 
 
                         self.state = ClientStateEnum::Receiving {
-                            fileset: writer,
+                            fileset,
                             session_id,
                             server,
                             phases,
@@ -2047,12 +2118,14 @@ mod client {
                     }
                     ClientStateEnum::Receiving { phases, mut  fileset, session_id, server } => {
                         info!("client receiving actual files, phases = {:?}", phases);
+                        let fileset = Arc::new(fileset);
+                        let mut writer = FileSetDiskWriter::new(&fileset).await;
 
                         ClientProtocolHandler::sync(session_id, &self.recv_socket, &self.send_socket,
-                                                    &mut fileset, &phases, server
+                                                    &mut writer, &phases, server
                         ).await?;
 
-                        fileset.shutdown().await?;
+                        writer.shutdown().await?;
 
                         debug!("Sync done");
                         return Ok(());
@@ -2075,12 +2148,14 @@ mod file_set {
     use rayon::prelude::IntoParallelIterator;
     use std::ffi::{OsStr, OsString};
     use std::fs::{DirEntry, FileType, Metadata, Permissions};
+    use std::hash::{DefaultHasher, Hash, Hasher};
     use std::ops::{Add, Sub};
     use std::ops::{Range, RangeInclusive};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use bytes::{BufMut, BytesMut};
+    use rangemap::RangeSet;
     use savefile::prelude::Savefile;
     use savefile::Serializer;
     use tracing::{debug, error, info, trace};
@@ -2149,6 +2224,47 @@ mod file_set {
     }
 
 
+    #[derive(Debug)]
+    pub enum WrittenComplete {
+        InProgress(RangeSet<u64>),
+        Done
+    }
+
+    impl Default for WrittenComplete {
+        fn default() -> Self {
+            WrittenComplete::InProgress(RangeSet::new())
+        }
+    }
+
+    impl WrittenComplete {
+        pub fn insert(&mut self, range: Range<u64>) {
+            match self {
+                WrittenComplete::InProgress(s) => {
+                    s.insert(range);
+                }
+                WrittenComplete::Done => {}
+            }
+        }
+        pub fn is_complete(&mut self, size: u64) -> bool {
+            match self {
+                WrittenComplete::InProgress(s) => {
+                    if let Some(first) = s.first() {
+                        if first == &(0..size) {
+                            *self = WrittenComplete::Done;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                WrittenComplete::Done => true
+            }
+        }
+    }
+
+
 
 
     #[derive(Savefile,Debug)]
@@ -2167,7 +2283,7 @@ mod file_set {
         checksum: AtomicChecksum,
         #[savefile_ignore]
         #[savefile_introspect_ignore]
-        written_complete: AtomicU64
+        written_complete: Mutex<WrittenComplete>
 
     }
 
@@ -2279,7 +2395,7 @@ mod file_set {
 
             let mut ret = vec![];
             while !rng.is_empty() {
-                let Some(boundary) = cursor.seek_next_file_boundary() else {
+                let Some((boundary,_)) = cursor.seek_next_file_boundary() else {
                     ret.push(rng);
                     break;
                 };
@@ -2326,14 +2442,39 @@ mod file_set {
         cur_phase: Phase,
         stack: Vec<&'a Entry>,
         path: PathBuf,
+        set_end: PhaseOffset,
+    }
+
+    impl<'a> FileSetCursor<'a> {
+        pub(crate) fn phase_offset(&self) -> PhaseOffset {
+            if let Some(top) = self.stack.last() {
+                top.first_offset()
+            } else {
+                PhaseOffset::ZERO
+            }
+        }
+        pub(crate) fn set_size(&self, phase: Phase) -> u64 {
+            self.set.max_offset_exclusive(phase).map(|x|x.0).unwrap_or(0)
+        }
+    }
+
+    pub fn hash_path(path: &Path) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        hasher.finish()
     }
 
     impl<'a> FileSetCursor<'a> {
 
-        pub fn seek_next_file_boundary(&mut self) -> Option<PhaseOffset> {
+        /// Returns the start offset of the next file, or None if there are no more files.
+        pub fn seek_next_file_boundary(&mut self) -> Option<(PhaseOffset, u64/*path hash*/)> {
             let next = self.stack.last().unwrap().last_offset_exclusive();
-            _ = self.seek(self.cur_phase, next).ok()?;
-            Some(next)
+            trace!("cursor next pos {:?}, set_end: {:?}", next, self.set_end);
+            if next == self.set_end {
+                return None;
+            }
+            let e = self.seek(self.cur_phase, next).ok()?;
+            Some((next, hash_path(e.path)))
         }
     }
 
@@ -2343,8 +2484,10 @@ mod file_set {
         pub file_offset: u64,
         // Size *including* checksum
         pub file_size: u64,
-        pub checksum: &'a AtomicChecksum,
-        pub written_complete: &'a AtomicU64,
+        /// This is the checksum value for this file transmitted by the sender, not what the bytes
+        /// we've received actually hash to.
+        pub expected_checksum: &'a AtomicChecksum,
+        pub written_complete: &'a Mutex<WrittenComplete>,
         /// PhaseOffset range occupied by complete file (including checksum)
         pub file_range: Range<PhaseOffset>,
     }
@@ -2376,6 +2519,7 @@ mod file_set {
                     self.path.clear();
                     self.stack.clear();
                     self.cur_phase = packet_phase;
+                    self.set_end = self.set.max_offset_exclusive(packet_phase).unwrap_or(PhaseOffset::ZERO);
                 }
                 if !self.stack.is_empty() && !self.cur_range().contains(&packet_offset) {
                     //debug!("Backing up, cur range is {} , {:?} which doesn't encompass packet {:?}", self.path.display(), self.cur_range(), packet_offset);
@@ -2401,14 +2545,14 @@ mod file_set {
                             path: &self.path,
                             file_offset,
                             file_size: f.size,
-                            checksum: &f.checksum,
+                            expected_checksum: &f.checksum,
                             written_complete: &f.written_complete,
                             file_range: f.offset .. f.offset + f.size,
                         });
                     }
                     Entry::Directory(d) => {
                         assert!(packet_offset >= d.offset);
-                        let entry = d.entry_for(packet_offset).ok_or_else(||anyhow!("offset is not in tree"))?;
+                        let entry = d.entry_for(packet_offset).ok_or_else(||anyhow!("offset is not in tree: {:?} (max offset: {:?})", packet_offset, self.set.max_offset_exclusive(packet_phase)))?;
                         debug!("Pushing name {:?}, seek: {:?}.{:?}, parent start: {:?} sub item range: {:?}", entry.name(), packet_phase, packet_offset,
                                 d.offset,
                                  entry.first_offset()..entry.last_offset_exclusive());
@@ -2425,9 +2569,9 @@ mod file_set {
 
     impl PhaseSize for FileSet {
         /// Returns None if phase is empty
-        fn max_offset_exclusive(&self, phase: u16) -> Option<PhaseOffset> {
+        fn max_offset_exclusive(&self, phase: Phase) -> Option<PhaseOffset> {
             Some(
-                self.phases[phase as usize]
+                self.phases[phase.0 as usize]
                     .entry
                     .last_offset_exclusive()
             )
@@ -2448,6 +2592,7 @@ mod file_set {
 
         pub fn make_cursor<'a>(&'a self) -> FileSetCursor<'a> {
             FileSetCursor {
+                set_end: self.max_offset_exclusive(Phase(0)).unwrap_or(PhaseOffset::ZERO),
                 set: self,
                 cur_phase: Phase(0),
                 stack: vec![],
@@ -2681,7 +2826,7 @@ mod file_set {
                     }
                 }
                 Entry::FileSet(Some(d)) => {PhaseOffset(d.len() as u64 + CHECKSUM_SIZE_U64)}
-                Entry::FileSet(_) => panic!("last_offset_exclusive called before FileSet added to structure")
+                Entry::FileSet(_) => PhaseOffset::ZERO
             }
         }
         fn assign_offsets(&mut self, accum_offset: &mut PhaseOffset) {
