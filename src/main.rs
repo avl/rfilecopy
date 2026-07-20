@@ -1,17 +1,11 @@
 use std::fmt::{Debug};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::num::NonZero;
-use crate::file_set::FileSet;
 use crate::messages::Message;
 use anyhow::{bail, Result};
 use rand::random;
-use savefile::IntrospectionError::IndexOutOfRange;
 use savefile::prelude::Savefile;
-use std::ops::Index;
-use std::ops::{Range, RangeInclusive};
+use std::ops::Range;
 use std::path::PathBuf;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tracing::debug;
 use crate::client::ClientConfig;
 use crate::server::{ServerConfig, ServerState};
 use crate::util::setup_tracing;
@@ -81,7 +75,7 @@ pub fn overlaps<T: Ord>(a: Range<T>, b: Range<T>) -> Option<Range<T>> {
     if a.end <= b.start || b.end <= a.start {
         return None;
     }
-    Some((a.start.max(b.start)..b.end.min(a.end)).into())
+    Some(a.start.max(b.start)..b.end.min(a.end))
 }
 
 /// Returns true if the range 'a' contains all of range 'b'.
@@ -145,15 +139,15 @@ impl PacketIdx {
 */
 mod messages {
     use crate::{PhaseOffset, RetransmitGeneration, SessionId, MTU_USIZE, Phase};
-    use anyhow::{Result, bail};
+    use anyhow::Result;
     use arrayvec::ArrayVec;
     use savefile::prelude::Savefile;
-    use savefile::{Deserializer, Serialize, Serializer};
+    use savefile::{Deserializer, Serializer};
     use std::ops::Range;
     use bytes::{Buf, BufMut, Bytes, BytesMut};
 
     pub const MAX_SECTIONS_PER_REQUEST: usize = 5;
-    const MAX_SECTIONS_PER_PAYLOAD: usize = 5;
+
 
     #[derive(Savefile, PartialEq, Debug, Clone)]
     #[repr(u8)]
@@ -229,11 +223,8 @@ mod messages {
             assert!(output.len() - bef <= MTU_USIZE, "output was {} but MTU is {}", output.len(), MTU_USIZE);
         }
 
-        pub fn msg_deserialize(mut input: Bytes) -> Result<Message> {
-            //debug!("bef savefile: {:?}", input);
-            let t= Ok(Deserializer::bare_deserialize(&mut input.reader(), 0)?);
-
-            t
+        pub fn msg_deserialize(input: Bytes) -> Result<Message> {
+            Ok(Deserializer::bare_deserialize(&mut input.reader(), 0)?)
         }
     }
     #[cfg(test)]
@@ -280,60 +271,25 @@ mod messages {
 }
 
 mod disk_read_engine {
-    use crate::file_set::{FileSet, Kind, OwnedSource, OwnedSourceId, Source};
-    use crate::messages::Payload;
-    use crate::{messages, PhaseOffset, PhaseSize, RetransmitGeneration, SessionId, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE, PAYLOAD_SIZE_USIZE_WITHOUT_HASH, PRE_REQUEST_TIME, Phase};
-    use anyhow::{anyhow, bail, Result, Context};
-    use indexmap::IndexMap;
-    use indexmap::map::Entry;
-    use lru::LruCache;
-    use rangemap::RangeSet;
-    use smallvec::SmallVec;
-    use std::collections::{HashMap, HashSet};
+    use crate::file_set::{FileSet, Kind, OwnedSource, OwnedSourceId};
+    
+    use crate::{PhaseOffset, RetransmitGeneration, SessionId, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, Phase};
+    use anyhow::{anyhow, Result, Context};
+    
+    
+    
+    
+    
+    use std::collections::HashMap;
     use std::io::{Read, Seek};
-    use std::mem::MaybeUninit;
-    use std::ops::{Range, RangeInclusive};
-    use std::path::{Path, PathBuf};
+    
+    use std::ops::Range;
+
     use std::sync::Arc;
     use bytes::{Bytes, BytesMut};
-    use tracing::{debug, trace};
+    use tracing::trace;
     use crate::util::ChecksummingState;
 
-    const READ_WORKERS: usize = 16;
-    const CACHE_SIZE_PACKETS: usize = 10000;
-    const READ_ENGINE_BUF_SIZE: usize = 4096;
-    const WORK_DIVISION_LENGTH: usize = 20 * READ_ENGINE_BUF_SIZE;
-
-    struct BytesMutTake(BytesMut, usize, usize);
-
-    fn split_large_ranges(
-        mut range: Range<PhaseOffset>,
-    ) -> impl Iterator<Item = Range<PhaseOffset>> {
-        std::iter::from_fn(move || {
-            let len = range.end - range.start;
-            if len == 0 {
-                return None;
-            }
-            if len < WORK_DIVISION_LENGTH as u64 {
-                let ret = range.clone();
-                range.start = range.end;
-                return Some(ret);
-            }
-            let new = range.start.0 + WORK_DIVISION_LENGTH as u64;
-
-            let mut ret = range.clone();
-            ret.end.0 = new;
-            range.start.0 = new;
-            return Some(ret);
-        })
-    }
-
-    struct WorkerRequest {
-        path: PathBuf,
-        offset_in_file: u64,
-        file_size: u64,
-        response: flume::Sender<Buf>,
-    }
 
 
     #[derive(Clone)]
@@ -343,109 +299,17 @@ mod disk_read_engine {
         checksums: HashMap<OwnedSourceId, ChecksummingState>,
     }
 
-    struct ReadAtom {
-        offset_in_file: u64,
-        size: u64,
-        data: [u8; READ_ENGINE_BUF_SIZE],
-        rest: Option<flume::Receiver<[u8; READ_ENGINE_BUF_SIZE]>>,
-    }
-
-    #[derive(Clone)]
-    struct Buf {
-        size: usize,
-        data: [u8; READ_ENGINE_BUF_SIZE],
-    }
-
 
     impl ReadEngine {
-        /*
-        async fn worker(
-            session_id: SessionId,
-            files: Arc<FileSet>,
-            rx: flume::Receiver<WorkerRequest>) -> Result<()> {
 
-            loop {
-                debug!("WOrker working");
-                let Ok(mut req) = rx.recv_async().await else {
-                    debug!("Worker exiting");
-                    return Ok(());
-                };
-                let mut file = compio::fs::File::open(&req.path).await?;
-
-                let mut total_to_read = (req.file_size - req.offset_in_file);
-                let to_read = total_to_read.min(READ_ENGINE_BUF_SIZE as u64);
-
-                let mut buf = Buf {
-                    size: to_read as usize,
-                    data: [0;_],
-                }
-                    ;
-
-                match file.read_exact_at(buf, req.offset_in_file).await.into_parts() {
-                    (Ok(_), mut buf) => {
-
-                        if let Ok(_) = req.response.send_async(buf.clone()).await {
-                            if total_to_read > to_read {
-                                req.offset_in_file += to_read;
-                                total_to_read -= to_read;
-                                loop {
-                                    if req.offset_in_file >= req.file_size {
-                                        break;
-                                    }
-                                    let to_read = total_to_read.min(READ_ENGINE_BUF_SIZE as u64);
-
-                                    buf = match file.read_exact_at(buf, req.offset_in_file).await.into_parts() {
-                                        (Ok(_), buf) => {
-                                            if req.response.send_async(buf.clone()).await.is_err() {
-                                                break;
-                                            }
-                                            req.offset_in_file += to_read;
-                                            total_to_read -= to_read;
-                                            buf
-                                        }
-                                        (Err(err), buf) => {
-                                            panic!("Failed reading file: {}: {:?}", req.path.display(), err);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                    }
-                    (Err(err), buf) => {
-                        panic!("Failed reading file: {}: {:?}", req.path.display(), err);
-                    }
-                }
-            }
-        }
-
-
-        fn fetch(&mut self, range: Range<PacketIdx>) {
-            self.inflight.insert(range.into());
-            debug!("CAching request sent");
-            self.cacher_requests.send(range).expect("workers should continue to run");
-        }
-
-        fn process(&mut self, pkt: Payload)  {
-
-            self.inflight.remove((pkt.index..self.successor(pkt.index)).into());
-
-            debug_assert!(!self.packet_cache.contains_key(&pkt.index));
-
-            self.packet_cache[self.packet_cache_insert_point] = pkt;
-            self.packet_cache_insert_point+= 1;
-            if self.packet_cache_insert_point >= CACHE_SIZE_PACKETS {
-                self.packet_cache_insert_point = 0;
-            }
-        }*/
 
         pub fn get_packets(
             &mut self,
             phase: Phase,
-            retransmit_generation: RetransmitGeneration,
-            session_id: SessionId,
+            _retransmit_generation: RetransmitGeneration,
+            _session_id: SessionId,
             idx: Range<PhaseOffset>,
-            mut tx: impl Fn(Bytes),
+            tx: impl Fn(Bytes),
         ) -> Result<()> {
             //TODO: Reuse these buffers
             let mut tasks = Vec::new();
@@ -472,14 +336,14 @@ mod disk_read_engine {
 
             let task_len = tasks.len();
 
-            for (task_i, (phase, phase_offset, source, offset, nominal_file_size, kind)) in
+            for (task_i, (_phase, phase_offset, source, offset, nominal_file_size, kind)) in
                 tasks.into_iter().enumerate()
             {
                 trace!("fetch task: {task_i}, offset = {offset}, nominal_file_size = {nominal_file_size}, kind = {kind:?}, phaserange {:?}", phase_offset);
                 let real_file_size = nominal_file_size - CHECKSUM_SIZE_U64;
 
                 // Size including any checksum (fragment)
-                let full_chunk_size = (phase_offset.end - phase_offset.start);
+                let full_chunk_size = phase_offset.end - phase_offset.start ;
 
                 let chunk_size = if offset < real_file_size {
                     full_chunk_size.min(real_file_size - offset)
@@ -496,8 +360,8 @@ mod disk_read_engine {
 
                 match (kind, &source) {
                     (Kind::Normal, OwnedSource::Path(path)) => {
-                        let mut file = std::fs::File::open(&path)?;
-                        file.seek(std::io::SeekFrom::Start(offset as u64))?;
+                        let mut file = std::fs::File::open(path)?;
+                        file.seek(std::io::SeekFrom::Start(offset))?;
                         //TODO: Can we get rid of this initialization?
                         buf.resize(buflen + chunk_size as usize, 0);
                         file.read_exact(
@@ -505,7 +369,7 @@ mod disk_read_engine {
                             )?;
                     }
                     (Kind::Symlink, OwnedSource::Path(path)) => {
-                        let link = std::fs::read_link(&path)?;
+                        let link = std::fs::read_link(path)?;
                         let linkbytes= link.to_string_lossy();
                         let linkbuf = linkbytes.as_bytes();
                         assert_eq!(linkbuf.len() as u64, real_file_size);
@@ -582,7 +446,7 @@ mod disk_read_engine {
             Ok(())
         }
 
-        pub async fn new(session_id: SessionId, files: Arc<FileSet>) -> Self {
+        pub async fn new(_session_id: SessionId, files: Arc<FileSet>) -> Self {
 
 
             Self {
@@ -595,20 +459,20 @@ mod disk_read_engine {
         fn get_checksum(
             &mut self,
             source: &OwnedSource,
-            real_file_size: u64,
+            _real_file_size: u64,
         ) -> Result<[u8; CHECKSUM_SIZE]> {
             let mut cksum = self.checksums.get_mut(&source.to_owned_id());
             if cksum.is_none() {
                 cksum = Some(self.checksums.entry(source.to_owned_id()).or_default());
             }
             match cksum.as_mut().unwrap() {
-                ChecksummingState::Hashing { hasher, offset/*, hashed_bytes*/ } => {
+                ChecksummingState::Hashing { hasher: _, offset: _/*, hashed_bytes*/ } => {
 
                     match source {
                         OwnedSource::Path(path) => {
                             // TODO: Maybe don't re-hash everything
                             let hash : [u8;CHECKSUM_SIZE] = blake3::Hasher::new()
-                                .update_mmap_rayon(&path).with_context(||anyhow!("checksumming file {}", path.display()))?   // mmaps the file + hashes it multithreaded
+                                .update_mmap_rayon(path).with_context(||anyhow!("checksumming file {}", path.display()))?   // mmaps the file + hashes it multithreaded
                                 .finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
                             trace!("Real file hashsum {:?}", hash);
                             Ok(hash)
@@ -629,12 +493,8 @@ mod disk_read_engine {
                         OwnedSource::Path(path) => {
 
                             let hash : [u8;CHECKSUM_SIZE] = blake3::Hasher::new()
-                                .update_mmap_rayon(&path).with_context(||anyhow!("checksumming file {}", path.display()))?   // mmaps the file + hashes it multithreaded
+                                .update_mmap_rayon(path).with_context(||anyhow!("checksumming file {}", path.display()))?   // mmaps the file + hashes it multithreaded
                                 .finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();
-
-                            /*let mut hasher2 = blake3::Hasher::new();
-                            hasher2.update(hashed_bytes);
-                            let hash2 : [u8;CHECKSUM_SIZE] = hasher2.finalize().as_bytes()[0..CHECKSUM_SIZE].try_into().unwrap();*/
 
 
                             trace!("Hashed bytes: {}", path.display()/*, String::from_utf8_lossy(hashed_bytes)*/);
@@ -659,10 +519,10 @@ mod disk_read_engine {
 }
 
 mod server {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::num::NonZeroUsize;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    
     use std::ops::Range;
-    use std::panic::PanicHookInfo;
+    
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -670,16 +530,16 @@ mod server {
     use crate::disk_read_engine::ReadEngine;
     use crate::file_set::{FileSet, Meta};
     use crate::messages::{Announce, LinkQualitySignal, Message, Payload, Request};
-    use crate::{overlaps, RetransmitGeneration, SessionId, DEFAULT_BIND_ADDRESS, MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, DEFAULT_MCAST_ADDR, PhaseOffset, PAYLOAD_SIZE, PAYLOAD_SIZE_USIZE, PRE_REQUEST_TIME, Phase};    use anyhow::{Result, bail};
+    use crate::{overlaps, RetransmitGeneration, SessionId, DEFAULT_BIND_ADDRESS, MAX_BURST_SIZE, MIN_BURST_SIZE, MTU, MTU_USIZE, DEFAULT_MCAST_ADDR, PhaseOffset, PAYLOAD_SIZE, Phase};    use anyhow::{Result, bail};
     use bytes::{Buf, Bytes, BytesMut};
-    use flume::{unbounded, Receiver, Sender};
-    use lru::LruCache;
-    use rangemap::RangeMap;
-    use savefile::Serialize;
-    use smallvec::SmallVec;
-    use tokio::{select, spawn};
+    use flume::{Receiver, Sender};
+    
+    
+    
+    
+    
     use tracing::{debug, error, info, trace, warn};
-    use crate::util::{reusable_multicast_socket, unicast_socket, TSocket, BSocket, blocking_socket, tokio_socket};
+    use crate::util::{reusable_multicast_socket, TSocket, BSocket, blocking_socket, tokio_socket};
     const FILE_READING_WORKERS: usize = 16;
 
     #[derive(Clone, Debug)]
@@ -742,7 +602,6 @@ mod server {
     struct ServerLogicState {
         session_id: SessionId,
         tx: flume::Sender<(RetransmitGeneration, Phase, Range<PhaseOffset>)>,
-        recently_sent_last_gc: RetransmitGeneration,
         current_retransmit_generation: RetransmitGeneration,
 
         pack_leader: SocketAddr,
@@ -772,7 +631,7 @@ mod server {
                 let mut r_size = r.end.0 - r.start.0;
                 if r_size > budget {
                     let overshot = r_size - budget;
-                    r.end.0 -= overshot as u64;
+                    r.end.0 -= overshot;
                     r_size = budget;
                 }
                 trace!("Ordering backend to send {:?}: {:?}", generation, r);
@@ -841,9 +700,7 @@ mod server {
             self.send(
                 r.phase,
                 self.current_retransmit_generation,
-                r.sections.into_iter().map(|offset_range| {
-                    offset_range
-                }),
+                r.sections.into_iter(),
             );
             Ok(())
         }
@@ -933,7 +790,7 @@ impl Accumulate {
             rx: flume::Receiver<(RetransmitGeneration,Phase, Range<PhaseOffset>)>,
             session_id: SessionId,
             config: ServerConfig,
-            mut read_engine: ReadEngine,
+            read_engine: ReadEngine,
             socket: Arc<BSocket>,
             fileset: Arc<FileSet>
         ) -> Result<()> {
@@ -986,7 +843,7 @@ impl Accumulate {
                         SendEvent::Flush=> {
                             accumulator.flush();
                         }
-                        SendEvent::Prepare(retransmit_generation, phase, mut range, sub_receiver, last) => {
+                        SendEvent::Prepare(retransmit_generation, phase, range, sub_receiver, last) => {
 
                             //println!("Background sender received {range:?}");
                             if range.is_empty() {
@@ -1000,7 +857,7 @@ impl Accumulate {
                             let eof_index = (range.end.0-range.start.0).div_ceil(MTU)/2;
 
                             // Returns bytes remaining
-                            let mut add_payload = |outbuf: &mut BytesMut, data: Bytes| {
+                            let mut add_payload = |_outbuf: &mut BytesMut, data: Bytes| {
                                 let datalen = data.len();
                                 assert!(datalen > 0);
                                 let payload = Payload {
@@ -1010,7 +867,7 @@ impl Accumulate {
                                     phase,
                                     index: output_idx,
                                     eof_approaching:
-                                      (last && eof_index == emitted_packets).then_some(range.end).unwrap_or(PhaseOffset::INVALID),
+                                        if last && eof_index == emitted_packets { range.end } else { PhaseOffset::INVALID },
                                     data,
                                 };
                                 pkt_ordinal = pkt_ordinal.wrapping_add(1);
@@ -1028,12 +885,6 @@ impl Accumulate {
                                 //println!("Calling sub_receiver");
                                 let Ok(mut fragment) = sub_receiver.recv() else {
                                     panic!("sub_receiver exited");
-                                    //println!("sub_receiver exited");
-                                    if !scratch.is_empty() {
-                                        _ = add_payload(&mut outbuf, scratch.split().freeze());
-                                        scratch.clear();
-                                    }
-                                    break;
                                 };
                                 //println!("Server fragment {:?}", fragment.len());
                                 let sub_recv_time = pre_sub.elapsed();
@@ -1083,7 +934,7 @@ impl Accumulate {
 
             let mut channel_txs = vec![];
 
-            for chn in 0..FILE_READING_WORKERS {
+            for _chn in 0..FILE_READING_WORKERS {
                 let (tx,rx) = flume::unbounded::<(Phase, RetransmitGeneration, Range<PhaseOffset>, Sender<_>)>();
                 let mut read_engine = read_engine.clone();
                 std::thread::spawn(move||{
@@ -1180,7 +1031,6 @@ impl Accumulate {
                 logic_state: ServerLogicState {
                     session_id,
                     tx,
-                    recently_sent_last_gc: RetransmitGeneration(0),
                     current_retransmit_generation: RetransmitGeneration(0),
                     pack_leader: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
                     packet_leader_position:(Phase(0), PhaseOffset(0)),
@@ -1267,26 +1117,26 @@ impl Accumulate {
 
 mod client {
     use std::fs::{File, OpenOptions};
-    use std::hash::{DefaultHasher, Hash, Hasher};
+
     use std::io::{IoSliceMut, Seek, SeekFrom, Write};
-    use crate::file_set::{hash_path, AtomicChecksum, FileSet, FileSetCursor};
+    use crate::file_set::{hash_path, AtomicChecksum, FileSet, FileSetCursor, ZeroSizedItem};
     use crate::messages::{LinkQualitySignal, Message, Request};
-    use crate::{PhaseOffset, SessionId, MTU_USIZE, RetransmitGeneration, DEFAULT_BIND_ADDRESS, DEFAULT_MCAST_ADDR, CHECKSUM_SIZE_U64, CHECKSUM_SIZE, contains, Phase};
+    use crate::{PhaseOffset, SessionId, MTU_USIZE, RetransmitGeneration, DEFAULT_BIND_ADDRESS, DEFAULT_MCAST_ADDR, CHECKSUM_SIZE_U64, CHECKSUM_SIZE, Phase};
     use anyhow::{anyhow, bail, Result, Context};
-    use savefile::{Deserialize, Deserializer, Serialize};
+    use savefile::Deserializer;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::ops::Range;
-    use std::path::{Path, PathBuf};
-    use std::pin::pin;
+    use std::path::PathBuf;
+    
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    
     use std::time::{Duration, Instant};
     use arrayvec::ArrayVec;
     use bytes::{Buf, Bytes, BytesMut};
     use flume::Receiver;
-    use futures_util::stream::FuturesUnordered;
-    use futures_util::StreamExt;
-    use indexmap::IndexSet;
+    
+
+    
     use rangemap::RangeSet;
     use tokio::spawn;
     use tokio::task::JoinHandle;
@@ -1314,7 +1164,6 @@ mod client {
         Initializing,
         AwaitingFileSet {
             session_id: SessionId,
-            phases: u16,
             server: SocketAddrV4,
             buf: Vec<u8>
         },
@@ -1350,8 +1199,8 @@ mod client {
     }
 
     impl FileSetDiskWriter<'_> {
-        pub async fn shutdown(mut self) -> Result<()> {
-            let Self {  jhs, txs, cursor } = self;
+        pub async fn shutdown(self) -> Result<()> {
+            let Self {  jhs, txs, cursor: _ } = self;
             drop(txs);
 
             for jh in jhs {
@@ -1428,7 +1277,7 @@ mod client {
                 let fileset = fileset.clone();
                 let mut curfile : Option<CurFile> = None;
                 let mut hashing_state = ChecksummingState::default();
-                let mut hasher_tx = hasher_tx.clone();
+                let hasher_tx = hasher_tx.clone();
 
                 jhs.push(spawn(async move {
                     // TODO: error handling
@@ -1445,18 +1294,45 @@ mod client {
                                 //TODO: Error handling!
                                 let input_phase = phase;
                                 let mut cur_phase_offset = input_idx;
-                                let mut end_phase_offset = cur_phase_offset + bytes.len() as u64;
+                                let end_phase_offset = cur_phase_offset + bytes.len() as u64;
 
-                                while cur_phase_offset != end_phase_offset {
+                                loop {
+                                    let mut errs = false;
+                                    let need = cursor.seek(input_phase, cur_phase_offset, &mut |zero_sized_path|{
+                                        match zero_sized_path {
+                                            ZeroSizedItem::Directory(d) => {
+                                                //TODO: error handling
+                                                if let Err(err) = std::fs::create_dir_all(&d) {
+                                                    error!("failed creating directory {}: {:?}", d.display(), err);
+                                                    errs= true;
+                                                }
+                                            }
+                                            ZeroSizedItem::File(f) => {
+                                                if let Err(err) = std::fs::File::create(&f) {
+                                                    error!("failed creating file {}: {:?}", f.display(), err);
+                                                    errs= true;
+                                                }
+                                            }
+                                        }
+                                        println!("Observed zero sized path: {:?}", zero_sized_path)
+                                    })?;
+                                    if errs {
+                                        //TODO: error handling
+                                        bail!("Exiting because couldn't create dir/file");
+                                    }
+
+                                    if cur_phase_offset == end_phase_offset {
+                                        break;
+                                    }
+                                    let need = need.unwrap(); //Only case we don't have a write-need is when we're at the end
 
                                     trace!("Processing phase {:?} {} byte write at {:?} (cur phase_offset.end: {:?})", input_phase, bytes.len(), cur_phase_offset, end_phase_offset);
 
-                                    let need = cursor.seek(input_phase, cur_phase_offset)?;
-                                    if let Some(curfile_inner) = curfile.as_mut() {
-                                        if curfile_inner.path != need.path || curfile_inner.phase != input_phase {
-                                            curfile = None;
-                                        }
+                                    if let Some(curfile_inner) = curfile.as_mut() &&
+                                        (curfile_inner.path != need.path || curfile_inner.phase != input_phase) {
+                                        curfile = None;
                                     }
+
                                     if curfile.is_none() {
                                         hashing_state = ChecksummingState::default();
                                         let path = need.path.to_path_buf();
@@ -1467,7 +1343,7 @@ mod client {
 
                                         curfile = Some(CurFile {
                                             path: path.clone(),
-                                            file: OpenOptions::new().write(true).create(true).open(&path).with_context(
+                                            file: OpenOptions::new().write(true).truncate(false).create(true).open(&path).with_context(
                                                 ||format!("Opening file for writing {}", path.display()))?,
                                             phase: input_phase,
                                         });
@@ -1518,7 +1394,7 @@ mod client {
                                             println!("Awaiting {} == {}", need.written_complete.load(Ordering::Relaxed), need.file_size);
                                             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                                         }*/
-                                        let mut f = curfile.take().unwrap();
+                                        let f = curfile.take().unwrap();
                                         //TODO: Make sure empty directories are created.
                                         // Could do as a pass when receiving bytes before empty dir in sequence
                                         f.file.set_len(need.file_size - CHECKSUM_SIZE_U64)?;
@@ -1565,18 +1441,19 @@ mod client {
 
 
     impl FileSetDiskWriter<'_> {
-        async fn write_impl(&mut self, phase: Phase, dest: PhaseOffset, mut data: Bytes, completed_range: Range<PhaseOffset>, hash_value : u64) -> Result<()> {
+        async fn write_impl(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>, hash_value : u64) -> Result<()> {
             Ok(self.txs[(hash_value as usize)%self.txs.len()].send_async(DiskWriteCommand::Write(phase, dest, data, completed_range)).await?)
         }
     }
     impl BlockReceiver for FileSetDiskWriter<'_> {
         async fn write(&mut self, phase: Phase, mut dest: PhaseOffset, mut data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
 
-            assert!(data.len() > 0 );
-            let mut entry = self.cursor.seek(phase, dest)?;
+            assert!(!data.is_empty());
+            let entry = self.cursor.seek(phase, dest, &mut |zero|{})?
+                .expect("every phase offset value is backed by a file");
             let mut cur_hash = hash_path(entry.path);
             trace!("Writing {} bytes at {:?} in phase {:?}, tree size: {:?}", data.len(), dest, phase, self.cursor.set_size(phase));
-            while data.len() > 0 {
+            while !data.is_empty() {
 
                 let Some((boundary, next_path_hash)) = self.cursor.seek_next_file_boundary() else {
                     self.write_impl(phase, dest, data, completed_range.clone(), cur_hash).await?;
@@ -1597,7 +1474,7 @@ mod client {
 
 
     impl BlockReceiver for Vec<u8> {
-        async fn write(&mut self, phase: Phase, dest: PhaseOffset, data: Bytes, completed_range: Range<PhaseOffset>) -> Result<()> {
+        async fn write(&mut self, _phase: Phase, dest: PhaseOffset, data: Bytes, _completed_range: Range<PhaseOffset>) -> Result<()> {
             trace!("block size: {}, dest: {}", self.len(), dest.0);
             self[dest.0 as usize .. dest.0 as usize + data.len()].copy_from_slice(&data);
             Ok(())
@@ -1615,13 +1492,13 @@ mod client {
             //TODO: Move sockets into some abstraction
             recv_socket: &TSocket,
             send_socket: &TSocket,
-            mut receiver: &mut impl BlockReceiver,
+            receiver: &mut impl BlockReceiver,
             phases: &[(Phase/*phase*/, PhaseOffset/*size*/)],
             peer: SocketAddrV4,
 
         ) -> Result<()> {
 
-            /// Missing range per phase
+            // Missing range per phase
             let mut missing = vec![];
             for (phase,phase_size) in phases.iter().copied() {
                 if missing.len() < phase.0 as usize + 1 {
@@ -1634,7 +1511,8 @@ mod client {
 
             let mut sendbuf = BytesMut::new();
 
-            async fn send_request(mut scratchbuf: &mut BytesMut, send_socket: &TSocket, phase: Phase, session_id: SessionId, missing: impl Iterator<Item=&Range<PhaseOffset>>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4, disallowed_range: Option<Range<PhaseOffset>>) -> Result<()> {
+            #[allow(clippy::too_many_arguments)]
+            async fn send_request(scratchbuf: &mut BytesMut, send_socket: &TSocket, phase: Phase, session_id: SessionId, missing: impl Iterator<Item=&Range<PhaseOffset>>, retransmit_generation: RetransmitGeneration, loss: LinkQualitySignal, dst: SocketAddrV4, disallowed_range: Option<Range<PhaseOffset>>) -> Result<()> {
                 let mut sections: ArrayVec<Range<PhaseOffset>, {super::messages::MAX_SECTIONS_PER_REQUEST}> = ArrayVec::new();
                 trace!("Disallowed range: {:?}", disallowed_range);
                 for mut rng in missing.cloned() {
@@ -1665,7 +1543,7 @@ mod client {
                     let mut start = rng.start;
                     let end = rng.end;
 
-                    if let Some(prev) = (&sections).last() {
+                    if let Some(prev) = sections.last() {
                         if end <= prev.end {
                             continue;
                         }
@@ -1696,19 +1574,19 @@ mod client {
                 trace!("sending request: {:?} to {:?}", request, dst);
                 println!("sending request: {:?} to {:?}", request, dst);
 
-                request.msg_serialize(&mut scratchbuf);
+                request.msg_serialize(scratchbuf);
                 send_socket.send_to(scratchbuf, SocketAddr::V4(dst)).await?;
                 Ok(())
             }
             let mut last_retransmit_generation = RetransmitGeneration(0);
-            /// We avoid stepping the generation back. But in degenerate cases,
-            /// we may have to, to avoid getting stuck. So keep a retry count.
+            // We avoid stepping the generation back. But in degenerate cases,
+            // we may have to, to avoid getting stuck. So keep a retry count.
             let mut last_retransmit_generation_update_counter = 0;
             let mut loss: LinkQualitySignal = LinkQualitySignal::KeepGoing;
             let mut no_loss_counter = 0;
 
             let mut bytes_received = 0u64;
-            let mut reception_start = Instant::now();
+            let _reception_start = Instant::now();
             let mut last_sped_print = Instant::now();
 
 
@@ -1739,12 +1617,12 @@ mod client {
 
             let mut io_vec_buffers: Vec<_> = vec![];
 
-            for (i,buf) in (0..batch_size).zip(iobufs.iter_mut()) {
+            for (_i,buf) in (0..batch_size).zip(iobufs.iter_mut()) {
                 io_vec_buffers.push(IoSliceMut::new(buf))
             }
             let mut meta_scratch = vec![];
 
-            for (phase, phase_size) in phases {
+            for (phase, _phase_size) in phases {
 
 
 
@@ -1790,7 +1668,7 @@ mod client {
                         trace!("timeout");
                         println!("timeout");
                         let phase_missing = &missing[phase.0 as usize];
-                        send_request(&mut sendbuf,&send_socket, *phase, session_id,
+                        send_request(&mut sendbuf,send_socket, *phase, session_id,
                                                phase_missing.iter(), last_retransmit_generation, loss, peer, None
                         ).await?;
                         loss = LinkQualitySignal::KeepGoing;
@@ -1853,7 +1731,7 @@ mod client {
 
 
                                             if phase_missing.overlaps(&range) {
-                                                trace!("received packet was useful");;
+                                                trace!("received packet was useful");
 
                                                 phase_missing.remove(range.clone());
 
@@ -1873,7 +1751,7 @@ mod client {
                                                 prev_pkt_ordinal = Some(p.pkt_ordinal);
 
                                                 let missing_range_end = phase_missing.overlapping(range.end..PhaseOffset::MAX).next().cloned();
-                                                let missing_range_start = phase_missing.overlapping(PhaseOffset::ZERO..range.start).rev().next().cloned();
+                                                let missing_range_start = phase_missing.overlapping(PhaseOffset::ZERO..range.start).next_back().cloned();
                                                 trace!("search for missing tree: {:?}", phase_missing);
                                                 trace!("search for missing after {:?} got {:?}", range.end, missing_range_end);
                                                 trace!("search for missing before {:?} got {:?}", range.start, missing_range_start);
@@ -1881,8 +1759,8 @@ mod client {
                                                 trace!("current gap - non-missing offsets: {:?}", consecutive_non_missing_range);
                                                 assert!(consecutive_non_missing_range.start <= consecutive_non_missing_range.end);
 
-                                                let writ_time = Instant::now();
-                                                assert!(p.data.len() > 0);
+                                                let _writ_time = Instant::now();
+                                                assert!(!p.data.is_empty());
                                                 receiver.write(p.phase, p.index, p.data, consecutive_non_missing_range).await?;
                                                 //if !receiver.try_write(p.phase, p.index, p.data.clone(), consecutive_non_missing_range.clone())? {
                                                 //
@@ -1899,7 +1777,7 @@ mod client {
                                                     let disallowed_range = range.start .. allowed_range_start;
 
                                                     //println!("EOF APPROACHING: {:?} (retran:{:?}, last retran: {:?})", p.eof_approaching, p.retransmit_generation, last_retransmit_generation);
-                                                    send_request(&mut sendbuf, &send_socket, *phase, session_id,
+                                                    send_request(&mut sendbuf, send_socket, *phase, session_id,
                                                                            phase_missing.iter(), last_retransmit_generation, loss.clone(), peer, Some(disallowed_range)
                                                     ).await?;
                                                     loss = LinkQualitySignal::KeepGoing;
@@ -1961,7 +1839,7 @@ mod client {
                 self.send_socket
                     .send_to(&buf, SocketAddr::V4(self.config.mcast_addr))
                     .await?;
-                let timeout = tokio::time::Instant::now() + Duration::from_secs(1);;
+                let timeout = tokio::time::Instant::now() + Duration::from_secs(1);
 
                 while tokio::time::Instant::now() < timeout {
                     let mut databuf = BytesMut::with_capacity(MTU_USIZE);
@@ -2014,11 +1892,10 @@ mod client {
                         self.state = ClientStateEnum::AwaitingFileSet {
                             session_id,
                             buf,
-                            phases,
                             server,
                         };
                     }
-                    ClientStateEnum::AwaitingFileSet { session_id, phases, server, mut buf } => {
+                    ClientStateEnum::AwaitingFileSet { session_id,  server, mut buf } => {
                         info!("client loading fileset");
                         let phase_0_size = buf.len();
                         ClientProtocolHandler::sync(session_id, &self.recv_socket, &self.send_socket,
@@ -2027,7 +1904,7 @@ mod client {
 
                         let calculated_checksum = blake3::hash(&buf[..buf.len()-CHECKSUM_SIZE]).as_bytes()[0..16].to_vec();
                         let received_checksum = &buf[buf.len()-CHECKSUM_SIZE..];
-                        if &calculated_checksum != received_checksum {
+                        if calculated_checksum != received_checksum {
                             bail!("Checksum mismatch - network corruption? Calculated checksum: {:?}, received: {:?}",
                                 calculated_checksum, received_checksum
                             );
@@ -2050,7 +1927,7 @@ mod client {
                             phases,
                         };
                     }
-                    ClientStateEnum::Receiving { phases, mut  fileset, session_id, server } => {
+                    ClientStateEnum::Receiving { phases, fileset, session_id, server } => {
                         info!("client receiving actual files, phases = {:?}", phases);
                         let fileset = Arc::new(fileset);
                         let mut writer = FileSetDiskWriter::new(&fileset).await;
@@ -2074,20 +1951,20 @@ mod client {
 }
 
 mod file_set {
-    use std::borrow::Borrow;
+    
     use crate::file_set::Entry::File;
     use crate::{overlaps, PhaseOffset, PhaseSize, CHECKSUM_SIZE, CHECKSUM_SIZE_U64, Phase, PRE_REQUEST_TIME};
     use anyhow::{Error, Result, anyhow, bail};
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
     use rayon::prelude::IntoParallelIterator;
-    use std::ffi::{OsStr, OsString};
-    use std::fs::{DirEntry, FileType, Metadata, Permissions};
+    
+    use std::fs::{DirEntry, Metadata, Permissions};
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::ops::{Add, Sub};
-    use std::ops::{Range, RangeInclusive};
+    use std::ops::Range;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, Ordering};
     use bytes::{BufMut, BytesMut};
     use rangemap::RangeSet;
     use savefile::prelude::Savefile;
@@ -2137,7 +2014,7 @@ mod file_set {
             }
         }
         pub fn update(&self, checksum: [u8; CHECKSUM_SIZE]) {
-            for i in (0..CHECKSUM_U32_WORDS) {
+            for i in 0..CHECKSUM_U32_WORDS  {
                 self.data[i].store(u32::from_le_bytes(checksum[4*i..4*(i+1)].try_into().unwrap()), Ordering::Relaxed);
             }
         }
@@ -2150,7 +2027,7 @@ mod file_set {
 
         pub fn bytes(&self) -> [u8; CHECKSUM_SIZE] {
             let mut buf = [0u8; CHECKSUM_SIZE];
-            for i in (0..CHECKSUM_U32_WORDS) {
+            for i in 0..CHECKSUM_U32_WORDS  {
                 buf[4*i..4*(i+1)].copy_from_slice(&self.data[i].load(Ordering::Relaxed).to_le_bytes());
             }
             buf
@@ -2243,15 +2120,24 @@ mod file_set {
     }
 
     impl RDirectory {
-        pub(crate) fn entry_for(&self, packet_offset: PhaseOffset) -> Option<&Entry> {
+        pub(crate) fn entry_for<'a>(&'a self, packet_offset: PhaseOffset, path_buf: &mut PathBuf, seen_zero_sized: &mut impl FnMut(ZeroSizedItem<'_>)) -> Option<&Entry> {
             let mut idx = match self.files
                 .binary_search_by_key(&packet_offset, |entry| entry.first_offset())
             {
                 Ok(found_index) => found_index,
                 Err(found_index) => found_index - 1,
             };
+            while idx > 0 && self.files[idx-1].first_offset() == packet_offset {
+                idx -= 1;
+            }
             while idx < self.files.len() &&
                 self.files[idx].last_offset_exclusive()<= packet_offset {
+                if self.files[idx].file_size() == 0 {
+                    assert_eq!(self.files[idx].first_offset(), packet_offset);
+
+                    self.files[idx].get_zero_sized(packet_offset, path_buf, seen_zero_sized);
+
+                }
                 idx += 1;
             }
             self.files.get(idx)
@@ -2263,6 +2149,32 @@ mod file_set {
         File(RFile),
         Directory(RDirectory),
         FileSet(Option<Arc<[u8]>>)
+    }
+
+    impl Entry {
+        pub(crate) fn get_zero_sized(&self,
+                                     phase_offset: PhaseOffset,
+                                     base_path: &mut PathBuf, seen_zero_sized: &mut impl FnMut(ZeroSizedItem<'_>)) {
+            match self {
+                File(f) => {
+                    base_path.push(&f.name);
+                    seen_zero_sized(ZeroSizedItem::File(base_path));
+                    base_path.pop();
+                }
+                Entry::Directory(d) => {
+                    base_path.push(&d.name);
+                    seen_zero_sized(ZeroSizedItem::Directory(base_path));
+                    for f in &d.files {
+                        if f.first_offset() == phase_offset {
+                            f.get_zero_sized(phase_offset, base_path, seen_zero_sized);
+                        }
+                    }
+                    base_path.pop();
+                }
+                Entry::FileSet(_) => {
+                }
+            }
+        }
     }
 
     impl Entry {
@@ -2281,7 +2193,7 @@ mod file_set {
                 Entry::Directory(d) => {
                     d.files.iter().map(|x|x.file_size()).sum()
                 }
-                Entry::FileSet(s) => {0}
+                Entry::FileSet(_s) => {0}
             }
         }
 
@@ -2311,7 +2223,7 @@ mod file_set {
     }
 
     impl FileSet {
-        pub(crate) fn replace_phase_paths(&mut self, paths: &Vec<PathBuf>) -> Result<()> {
+        pub(crate) fn replace_phase_paths(&mut self, paths: &[PathBuf]) -> Result<()> {
             if paths.len() +1  != self.phases.len() {
                 bail!("Wrong number of input paths. The number of input paths must be {}, not {}", self.phases.len().saturating_sub(1), paths.len());
             }
@@ -2325,7 +2237,7 @@ mod file_set {
                 return vec![rng];
             }
             let mut cursor = self.make_cursor();
-            cursor.seek(phase, rng.start).unwrap(); //TODO: error handling
+            cursor.seek(phase, rng.start, &mut |_|{}).unwrap(); //TODO: error handling
 
             let mut ret = vec![];
             while !rng.is_empty() {
@@ -2363,7 +2275,7 @@ mod file_set {
         #[cfg(target_family = "unix")]
         {
             use std::os::unix::fs::PermissionsExt;
-            permissions.mode() as u32
+            permissions.mode()
         }
         #[cfg(not(target_family = "unix"))]
         {
@@ -2380,7 +2292,8 @@ mod file_set {
     }
 
     impl<'a> FileSetCursor<'a> {
-        pub(crate) fn phase_offset(&self) -> PhaseOffset {
+        #[allow(unused)]
+        pub fn phase_offset(&self) -> PhaseOffset {
             if let Some(top) = self.stack.last() {
                 top.first_offset()
             } else {
@@ -2407,9 +2320,16 @@ mod file_set {
             if next == self.set_end {
                 return None;
             }
-            let e = self.seek(self.cur_phase, next).ok()?;
+            let e = self.seek(self.cur_phase, next, &mut|_|{}).ok()??;
             Some((next, hash_path(e.path)))
         }
+    }
+
+
+    #[derive(Debug)]
+    pub enum ZeroSizedItem<'a> {
+        Directory(&'a Path),
+        File(&'a Path),
     }
 
     #[derive(Debug)]
@@ -2429,18 +2349,19 @@ mod file_set {
     impl<'a> FileSetCursor<'a> {
         fn cur_range(&self) -> Range<PhaseOffset> {
             if self.set.num_phases() == 0 {
-                return (PhaseOffset::ZERO..PhaseOffset::ZERO).into();
+                return PhaseOffset::ZERO..PhaseOffset::ZERO;
             };
 
             if let Some(top) = self.stack.last() {
-                (top.first_offset()..top.last_offset_exclusive()).into()
+                top.first_offset()..top.last_offset_exclusive()
             } else {
-                (self.set.phases.first().unwrap().entry.first_offset()
-                    ..self.set.phases.last().unwrap().entry.last_offset_exclusive())
-                    .into()
+                self.set.phases.first().unwrap().entry.first_offset()
+                    ..self.set.phases.last().unwrap().entry.last_offset_exclusive()
             }
         }
-        pub fn seek(&mut self, packet_phase: Phase, packet_offset: PhaseOffset) -> Result<WriteNeed> {
+
+        /// Returns None if offset is exactly at end of tree
+        pub fn seek(&mut self, packet_phase: Phase, packet_offset: PhaseOffset, seen_zero_sized: &mut impl FnMut(ZeroSizedItem<'_>)) -> Result<Option<WriteNeed<'_>>> {
             if packet_phase.0 as usize >= self.set.num_phases() {
                 bail!("Bad phase");
             }
@@ -2473,25 +2394,34 @@ mod file_set {
                 match top {
                     File(f) => {
                         let file_offset = packet_offset.0 - f.offset.0;
+                        if f.size == 0 {
+                            seen_zero_sized(ZeroSizedItem::File(&self.path));
+                            // We only get here if all there is in the entire fileset is this single zero-sized file
+                            return Ok(None);
+                        }
                         debug_assert!(file_offset < f.size);
                         assert!(f.size > 0); // TODO: zero sized files can't be naturally supported. We need to add a post-process step to create 0-sized files and directories
-                        return Ok(WriteNeed {
+                        return Ok(Some(WriteNeed {
                             path: &self.path,
                             file_offset,
                             file_size: f.size,
                             expected_checksum: &f.checksum,
                             written_complete: &f.written_complete,
                             file_range: f.offset .. f.offset + f.size,
-                        });
+                        }));
                     }
                     Entry::Directory(d) => {
                         assert!(packet_offset >= d.offset);
-                        let entry = d.entry_for(packet_offset).ok_or_else(||anyhow!("offset is not in tree: {:?} (max offset: {:?})", packet_offset, self.set.max_offset_exclusive(packet_phase)))?;
-                        debug!("Pushing name {:?}, seek: {:?}.{:?}, parent start: {:?} sub item range: {:?}", entry.name(), packet_phase, packet_offset,
+                        let entry = d.entry_for(packet_offset, &mut self.path, seen_zero_sized);
+                        if let Some(entry) = entry {
+                            debug!("Pushing name {:?}, seek: {:?}.{:?}, parent start: {:?} sub item range: {:?}", entry.name(), packet_phase, packet_offset,
                                 d.offset,
                                  entry.first_offset()..entry.last_offset_exclusive());
-                        self.path.push(entry.name());
-                        self.stack.push(entry);
+                            self.path.push(entry.name());
+                            self.stack.push(entry);
+                        } else {
+                            return Ok(None);
+                        }
                     }
                     Entry::FileSet(_) => {
                         unreachable!("fileset is only in phase 0")
@@ -2565,7 +2495,7 @@ mod file_set {
         }
 
         /// Always visits in PhaseOffset-order, guaranteed
-        pub fn visit<'a>(
+        pub fn visit(
             &self,
             phase: Phase,
             range: Range<PhaseOffset>,
@@ -2589,7 +2519,7 @@ mod file_set {
 
         pub fn new(items: Vec<impl AsRef<Path>>) -> Result<FileSet> {
 
-            let mut items: Vec<PathBuf> = items.iter().map(|x| x.as_ref().into()).collect();
+            let items: Vec<PathBuf> = items.iter().map(|x| x.as_ref().into()).collect();
             info!("fileset created from paths: {:#?}", items);
 
 
@@ -2601,7 +2531,7 @@ mod file_set {
                 }
             ];
 
-            let mut non_fileset_phases : Vec<_> = items
+            let non_fileset_phases : Vec<_> = items
                 .par_iter()
                 .map(|x| Ok(
                     FileSetPhaseEntry {
@@ -2618,7 +2548,7 @@ mod file_set {
             .assign_offsets())
         }
 
-        fn assign_offsets(mut self) -> Self {
+        fn assign_offsets(self) -> Self {
             Self {
                 phases: self
                     .phases
@@ -2690,7 +2620,7 @@ mod file_set {
                 Entry::File(f) => {
                     if let Some(overlap) = overlaps(f.range(), range.clone()) {
                         cwd.push(&f.name);
-                        func(overlap.clone(), Source::Path(&cwd), overlap.start - f.offset, f.size, f.kind);
+                        func(overlap.clone(), Source::Path(cwd), overlap.start - f.offset, f.size, f.kind);
                         cwd.pop();
                     } else {
                         trace!("Ignoring file {} because it doesn't overlap range", f.name.display());
@@ -2780,19 +2710,43 @@ mod file_set {
             }
         }
 
+        fn move_nonzero_last(&mut self) {
+            match self {
+                File(_) => {}
+                Entry::Directory(dir) => {
+                    for i in (0..dir.files.len()).rev() {
+                        if dir.files[i].file_size() > 0 {
+                            let dirlen = dir.files.len();
+                            if i != dirlen - 1 {
+                                compiler_error("Understand why morse still doesn't copy last out dir!")
+                                dir.files.swap(i, dirlen-1);
+                                break;
+                            }
+                            dir.files.last_mut().unwrap().move_nonzero_last();
+                            break;
+                        }
+                    }
+                }
+                Entry::FileSet(_) => {}
+            }
+        }
+
         fn new(item: impl AsRef<Path>) -> Result<Entry> {
             let item: &Path = item.as_ref();
             let meta: Metadata = std::fs::metadata(item)?;
             Ok(if !meta.is_dir() {
                 Entry::create_file(item.into(), meta)?
             } else {
-                Entry::scan(item, "".into())?
+                let mut dir = Entry::scan(item, "".into())?;
+                let mut x = Entry::Directory(dir);
+                x.move_nonzero_last();
+                x
             })
         }
-        fn scan(name: &Path, logical_name: PathBuf) -> Result<Entry> {
+        fn scan(name: &Path, logical_name: PathBuf) -> Result<RDirectory> {
             let dir: Vec<std::io::Result<DirEntry>> = std::fs::read_dir(name)?.collect();
 
-            Ok(Entry::Directory(RDirectory {
+            Ok(RDirectory {
                 // Will be filled later
                 offset: PhaseOffset(0),
                 name: logical_name,
@@ -2814,17 +2768,20 @@ mod file_set {
                             };
                             let typ = meta.file_type();
                             if typ.is_file() || typ.is_symlink() {
-                                return Some(Self::create_file(entry.file_name().into(), meta));
+                                Some(Self::create_file(entry.file_name().into(), meta))
                             } else if typ.is_dir() {
-                                return Some(Entry::scan(&entry.path(), entry.file_name().into()));
+                                match Entry::scan(&entry.path(), entry.file_name().into()) {
+                                    Ok(e) => Some(Ok(Entry::Directory(e))),
+                                    Err(e) => Some(Err(e)),
+                                }
                             } else {
                                 error!("{:?} is not a file or symlink", entry.path());
-                                return None;
+                                None
                             }
                         },
                     )
                     .collect::<Result<Vec<Entry>>>()?,
-            }))
+            })
         }
 
         fn create_file(name: PathBuf, meta: Metadata) -> Result<Entry, Error> {
@@ -2933,68 +2890,15 @@ mod util {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
     use bytes::BytesMut;
-    use futures_util::stream::Peek;
+    
     use quinn_udp::{RecvMeta, Transmit, UdpSocketState};
     use socket2::{Domain, Protocol, Socket, Type};
     use tokio::io::Interest;
     use tokio::net::UdpSocket;
-    use tracing::{info, warn};
+    use tracing::info;
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use crate::{CHECKSUM_SIZE, MTU_USIZE};
-
-    struct PeekableReceiver<T> {
-        inner: flume::Receiver<T>,
-        peeked: Option<T>,
-    }
-
-    impl<T> PeekableReceiver<T> {
-        pub fn peek(&mut self) -> Option<&T> {
-            if self.peeked.is_some() {
-                return self.peeked.as_ref();
-            }
-            if let Ok(t) = self.inner.try_recv() {
-                self.peeked = Some(t);
-                return self.peeked.as_ref();
-            }
-            None
-        }
-        pub fn recv(&mut self) -> Result<T, flume::RecvError> {
-            if let Some(p) = self.peeked.take() {
-                return Ok(p);
-            }
-            self.inner.recv()
-        }
-    }
-
-
-    //TODO: Get rid of this?
-    pub fn fast_hash(bytes: &[u8]) -> u64 {
-        const K: u64 = 0x517c_c1b7_2722_0a95; // odd, well-mixed constant
-
-        let mut hash: u64 = 0;
-        let mut chunks = bytes.chunks_exact(8);
-
-        for chunk in &mut chunks {
-            let word = u64::from_le_bytes(chunk.try_into().unwrap());
-            hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
-        }
-
-        // Fold in the remaining 1..=7 tail bytes.
-        let rem = chunks.remainder();
-        if !rem.is_empty() {
-            let mut buf = [0u8; 8];
-            buf[..rem.len()].copy_from_slice(rem);
-            let word = u64::from_le_bytes(buf);
-            hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
-        }
-
-        // Final avalanche so all bits are well mixed.
-        hash ^= hash >> 32;
-        hash = hash.wrapping_mul(K);
-        hash ^= hash >> 32;
-        hash
-    }
 
     pub struct TSocket {
         state: UdpSocketState,
@@ -3006,11 +2910,6 @@ mod util {
         socket: std::net::UdpSocket,
     }
 
-    pub struct RecvResult {
-        pub src: SocketAddr,
-        pub stride: usize,
-        pub size: usize,
-    }
 
 
     impl BSocket {
@@ -3022,7 +2921,7 @@ mod util {
             let transmit = Transmit {
                 destination: dst,
                 ecn: None,
-                contents: buf.into(),
+                contents: buf,
                 segment_size: Some(MTU_USIZE),
                 src_ip: None,
             };
@@ -3063,7 +2962,7 @@ mod util {
             let transmit = Transmit {
                 destination: dst,
                 ecn: None,
-                contents: buf.into(),
+                contents: buf,
                 segment_size: Some(MTU_USIZE), // kernel splits into 1280 + 320
                 src_ip: None,
             };
@@ -3096,9 +2995,8 @@ mod util {
             Ok(())
         }
 
-        pub async fn recv_single_from<'a>(&self, data: &mut BytesMut) -> std::io::Result<(usize, SocketAddr)> {
-
-            Ok(self.socket.recv_buf_from(data).await?)
+        pub async fn recv_single_from(&self, data: &mut BytesMut) -> std::io::Result<(usize, SocketAddr)> {
+            self.socket.recv_buf_from(data).await
         }
 
         pub fn match_recv_batch_size(&self) -> usize {
@@ -3109,8 +3007,7 @@ mod util {
             meta_scratch.resize(buf.len(), RecvMeta::default());
             loop {
                 let n = match self.socket.async_io(Interest::READABLE, || {
-                    let temp = self.state.recv((&self.socket).into(), buf, meta_scratch);
-                    temp
+                    self.state.recv((&self.socket).into(), buf, meta_scratch)
                 }).await {
                     Ok(n) => n,
                     // recv.readable() can lead to false positives. Try again.
@@ -3145,7 +3042,7 @@ mod util {
 
     pub fn tokio_socket(socket: std::net::UdpSocket) -> std::io::Result<TSocket> {
         socket.set_nonblocking(true)?;
-        let mut state = UdpSocketState::new((&socket).into())?;
+        let state = UdpSocketState::new((&socket).into())?;
         //TODO: Remove dupe code
         state.set_recv_buffer_size((&socket).into(), 2*MTU_USIZE*state.gro_segments())?;
         state.set_send_buffer_size((&socket).into(), 2*MTU_USIZE*state.max_gso_segments())?;
@@ -3160,7 +3057,7 @@ mod util {
 
     pub fn blocking_socket(socket: std::net::UdpSocket) -> std::io::Result<BSocket> {
         socket.set_nonblocking(false)?;
-        let mut state = UdpSocketState::new((&socket).into())?;
+        let state = UdpSocketState::new((&socket).into())?;
         state.set_recv_buffer_size((&socket).into(), 2*MTU_USIZE*state.gro_segments())?;
         state.set_send_buffer_size((&socket).into(), 2*MTU_USIZE*state.max_gso_segments())?;
         Ok(
@@ -3197,7 +3094,7 @@ mod util {
         sock.bind(&bind_addr.into())?;
 
         // Join the multicast group.
-        sock.join_multicast_v4(&group.ip(), &iface)?;
+        sock.join_multicast_v4(group.ip(), &iface)?;
 
         sock.set_multicast_loop_v4(true)?;
 
@@ -3231,6 +3128,7 @@ mod util {
 
     //TODO: Move to util?
     #[derive(Debug, Clone)]
+    #[allow(clippy::large_enum_variant)] //It's a few kilobytes, but this is fine
     pub enum ChecksummingState {
         Hashing { hasher: blake3::Hasher, offset: u64},
         Finished([u8; CHECKSUM_SIZE]),
@@ -3358,11 +3256,11 @@ async fn main() -> anyhow::Result<()> {
 
 
 mod tests {
-    use tokio::spawn;
-    use crate::client;
-    use crate::client::ClientConfig;
-    use crate::server::ServerConfig;
-    use crate::util::setup_tracing;
+    
+    
+    
+    
+    
 
     #[tokio::test]
     async fn start_client() {
