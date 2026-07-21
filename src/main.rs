@@ -662,7 +662,7 @@ mod server {
             {
                 self.pack_leader_last_head = Instant::now();
                 debug!("pack leader changed to {}", src);
-                println!("pack leader changed to {}", src);
+                info!("pack leader changed to {}", src);
                 self.pack_leader = src;
                 self.packet_leader_position = (r.phase, first_idx);
             }
@@ -674,16 +674,13 @@ mod server {
 
             if r.retransmit_generation.0 != self.current_retransmit_generation.0 {
                 trace!("Retransmit gen mismatch, {} vs {}",  r.retransmit_generation.0, self.current_retransmit_generation.0 );
-                println!("Retransmit gen mismatch, {} vs {}",  r.retransmit_generation.0, self.current_retransmit_generation.0 );
                 //TODO: Constants
                 if self.time_when_last_out_of_date_retransmit_gen_accepted.elapsed() > Duration::from_secs(1) {
-                    warn!("Retransmit gen mismatch timer elapsed");
-                    println!("Retransmit gen mismatch timer elapsed");
+                    debug!("Retransmit gen mismatch timer elapsed");
                     self.time_when_last_out_of_date_retransmit_gen_accepted = Instant::now();
                 }
                 else {
                     trace!("ignore retransmit generation {} because current is {}",r.retransmit_generation.0, self.current_retransmit_generation.0);
-                    println!("ignore retransmit generation {} because current is {}",r.retransmit_generation.0, self.current_retransmit_generation.0);
                     return Ok(());
                 }
             }
@@ -728,7 +725,7 @@ mod server {
                 Message::Announce(_) => {
                 }
                 Message::RequestAnnounce => {
-                    println!("REceived announce request");
+                    info!("New client detected: {:?}", src);
                     ServerState::process_request_announce(self.session_id, &self.multicast_socket, src, &self.meta).await.expect("process request announce"); //TODO: Fix error hadnling
                 }
             }
@@ -1652,7 +1649,7 @@ mod client {
 
                     let Ok(result) = result else {
                         debug!("timeout");
-                        println!("timeout");
+
 
                         let phase_missing = &missing[phase.0 as usize];
                         send_request(&mut sendbuf,send_socket, *phase, session_id,
@@ -1687,7 +1684,7 @@ mod client {
                                         if p.phase != *phase {
 
                                             if p.phase > *phase  && last_fallbehind_message_sent.elapsed() > Duration::from_millis(50) {
-                                                println!("We're behind a phase, sending request");
+                                                info!("We're behind a phase, sending request");
                                                 let phase_missing = &missing[phase.0 as usize];
                                                 send_request(&mut sendbuf,send_socket, *phase, session_id,
                                                              phase_missing.iter(), last_retransmit_generation, loss, peer, None
@@ -1736,7 +1733,7 @@ mod client {
 
                                                 if let Some(prev_pkt_ordinal) = prev_pkt_ordinal {
                                                     if prev_pkt_ordinal.wrapping_add(1) != p.pkt_ordinal {
-                                                        println!("Loss detected: {:?}", phase_missing);
+                                                        info!("Loss detected: {:?}", phase_missing);
                                                         loss = LinkQualitySignal::LossDetected;
                                                         no_loss_counter = 0;
                                                     } else {
